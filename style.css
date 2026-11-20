@@ -23,6 +23,7 @@ button { font-family: inherit; cursor: pointer; }
 
 #topright { position: fixed; top: 16px; right: 16px; display: flex; gap: 8px; z-index: 5; }
 .iconbtn { padding: 9px 14px; color: #2b2f45; font-size: 13.5px; border-radius: 999px; transition: background .15s; }
+.iconbtn.off { opacity: .6; }
 .iconbtn:hover { background: rgba(255, 236, 236, .95); }
 
 #places { position: fixed; top: 112px; left: 16px; padding: 10px; display: none; flex-direction: column; gap: 5px; z-index: 5; }
@@ -40,6 +41,10 @@ button { font-family: inherit; cursor: pointer; }
   padding: 16px 18px; opacity: 0; pointer-events: none; transition: opacity .3s ease, transform .3s ease; z-index: 6;
   border-top: 4px solid #2f8a52; }
 #panel.show { opacity: 1; transform: translate(-50%, 0); pointer-events: auto; }
+#panel.compact { padding: 10px 14px; }
+#panel.compact h3 { font-size: 15px; margin-bottom: 0; }
+#panel.compact p, #panel.compact .info { display: none; }
+#panel.compact .actions { margin-top: 8px; }
 #panel h3 { font-size: 17.5px; margin-bottom: 4px; color: #b82a2a; letter-spacing: -.2px; }
 #panel p { font-size: 13px; opacity: .85; line-height: 1.55; }
 #panel .info { margin-top: 7px; font-size: 12.5px; color: #2f7d4f; font-weight: 600; }
@@ -48,6 +53,23 @@ button { font-family: inherit; cursor: pointer; }
   padding: 9px 14px; border-radius: 12px; font-size: 13.5px; transition: background .15s, transform .12s; box-shadow: 0 2px 0 rgba(214,58,58,.12); }
 #panel .actions button:hover { background: #fff0f0; transform: translateY(-1px); }
 #panel .actions button.on { background: #e7f5ec; border-color: rgba(47,138,82,.45); }
+
+/* 다른 공간으로 이동 중 */
+#travel { position: fixed; inset: 0; z-index: 40; opacity: 0; pointer-events: none; transition: opacity .5s ease;
+  background: radial-gradient(ellipse at 50% 45%, #ffffff 0%, #e4f0fb 55%, #bcd7f2 100%); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; }
+#travel.on { opacity: 1; pointer-events: auto; }
+#travel.instant { transition: none; }
+#travel .go-msg { display: flex; align-items: center; gap: 10px; color: #b82a2a; font-size: 20px; font-weight: 800; }
+#travel .go-sub { color: #2f7d4f; font-size: 13px; opacity: .8; }
+#travel .go-dots { display: inline-flex; gap: 5px; }
+#travel .go-dots i { width: 7px; height: 7px; border-radius: 50%; background: #d63a3a; animation: goDot 1.2s ease-in-out infinite; }
+#travel .go-dots i:nth-child(2) { animation-delay: .2s; background: #2f8a52; }
+#travel .go-dots i:nth-child(3) { animation-delay: .4s; background: #e8b23a; }
+@keyframes goDot { 0%, 80%, 100% { opacity: .25; transform: translateY(0); } 40% { opacity: 1; transform: translateY(-5px); } }
+html.arriving #intro { visibility: hidden; }
+/* 다른 공간 탭 (길찾기 옆) */
+.space-tab { background: rgba(255, 240, 225, .85) !important; border: 1px solid rgba(214, 58, 58, .3) !important; }
+.space-tab:hover { background: #ffe6d4 !important; }
 
 #fade { position: fixed; inset: 0; background: #fffaf2; opacity: 0; pointer-events: none; transition: opacity .4s ease; z-index: 19; }
 #fade.on { opacity: 1; }
@@ -92,8 +114,32 @@ button { font-family: inherit; cursor: pointer; }
 #intro .enter:disabled { background: #b9c3cf; box-shadow: 0 4px 0 #8b95a3; cursor: default; }
 #intro .enter:not(:disabled):hover { transform: translateY(-1px); }
 
+/* 시작 화면 — 집 소개 */
+#intro .box { max-height: 92vh; overflow-y: auto; }
+#intro .houses-title { margin: 14px 0 8px; font-size: 13.5px; font-weight: 700; color: #b82a2a; }
+#intro .houses { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; text-align: left; }
+#intro .houses .h { background: rgba(255,255,255,.65); border-radius: 10px; padding: 7px 9px; display: flex; flex-direction: column; gap: 1px; }
+#intro .houses b { font-size: 12.5px; color: #2b2f45; }
+#intro .houses span { font-size: 11.5px; color: #5a6075; line-height: 1.35; }
+#intro .howto { margin-top: 10px; font-size: 12px; color: #5a6075; }
+.touch { display: none; }
+@media (pointer: coarse) { .touch { display: block; } .pc { display: none; } li.touch { display: list-item; } }
+
 @media (max-width: 640px) {
   #topright .iconbtn span, #gestures button span { display: none; }
-  #hud { padding: 8px 12px; }
-  #places { top: 96px; }
+  /* 휴대폰 — 오른쪽 버튼은 세로로, 왼쪽 이름표는 작게 (서로 겹쳐 버튼이 안 눌리던 문제) */
+  #topright { flex-direction: column; top: 12px; right: 10px; gap: 6px; }
+  #topright .iconbtn { width: 44px; height: 44px; padding: 0; display: flex; align-items: center; justify-content: center; font-size: 16px; }
+  #topright #btn-places b, .space-tab .lbl { display: none; }
+  #hud { top: 12px; left: 10px; padding: 7px 11px; max-width: calc(100vw - 80px); }
+  #hud .title { font-size: 15px; }
+  #hud .me { font-size: 11.5px; }
+  #places { top: 12px; right: 62px; left: auto; max-height: 80vh; overflow-y: auto; }
+  #toast { top: 104px; max-width: calc(100vw - 80px); left: calc(50% - 30px); font-size: 13px; border-radius: 16px; }   /* 이름표 아래 · 오른쪽 버튼 피해서 — 아래 패널과 안 겹치게 */
+  #panel { bottom: 76px; width: calc(100vw - 20px); padding: 10px 12px; }
+  #panel .actions button { padding: 8px 11px; font-size: 13px; }
+  #gestures { left: 50%; transform: translateX(-50%); bottom: 12px; }
+  #intro .box { padding: 20px 16px 18px; }
+  #intro h1 { font-size: 28px; }
+  #intro ul { font-size: 13px; padding: 11px 13px; gap: 5px; }
 }

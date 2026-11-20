@@ -67,7 +67,10 @@
   // 내 이름
   const ADJ = ['포근한', '반짝이는', '따끈한', '설레는', '폭신한', '달콤한', '방울방울', '소복소복'];
   const NOUN = ['눈사람', '루돌프', '진저쿠키', '눈송이', '양말', '종소리', '썰매', '펭귄'];
-  let myName = localStorage.getItem('santa.name') || `${pick(ADJ)} ${pick(NOUN)}`;
+  // 이름은 쉼터 · 불멍과 같은 칸(shelter:name)을 먼저 씀 — 공간을 오가도 같은 이름
+  let myName = localStorage.getItem('shelter:name') || localStorage.getItem('santa.name') || `${pick(ADJ)} ${pick(NOUN)}`;
+  const params = new URLSearchParams(location.search);
+  const room = (params.get('room') || localStorage.getItem('shelter:lastRoom') || 'MAIN').replace(/[^a-zA-Z0-9가-힣-]/g, '').toUpperCase().slice(0, 12) || 'MAIN';
   localStorage.setItem('santa.name', myName);
   $('#myname').textContent = myName;
 
@@ -102,6 +105,7 @@
   const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 700);
 
   const matCache = new Map();
+  const glowMats = [], tmpC0 = new THREE.Color();   // 전구 빛무리 재질들 (매 프레임 시간 갱신)
   function mat(color, opts = {}) {
     const key = color + JSON.stringify(opts);
     if (!matCache.has(key)) matCache.set(key, new THREE.MeshStandardMaterial({ color, roughness: 0.8, ...opts }));
@@ -343,6 +347,12 @@
     }
     const d = Math.hypot(p.x, p.z);
     if (d > 47) { p.x *= 47 / d; p.z *= 47 / d; }
+    // 얼음판 — 스케이트를 신은 나만 들어갈 수 있음 (다른 사람 · 걷는 나는 가장자리로 밀려남)
+    if (!(player.userData.skate && (p === player.position || onIce(p.x, p.z)))) {   // 스케이트 신은 나 · 내 얼음 위 목적지는 통과
+      const PM = 1.5;   // 둘레 기둥(+1.0) 바깥까지 — 기둥과 얼음 사이에 갇히지 않게
+      const ex = (p.x - POND.x) / (POND.rx + PM), ez = (p.z - POND.z) / (POND.rz + PM), ed = Math.hypot(ex, ez);
+      if (ed < 1 && ed > 1e-4) { p.x = POND.x + ex / ed * (POND.rx + PM); p.z = POND.z + ez / ed * (POND.rz + PM); }
+    }
   }
 
   // ------------------------------------------------------------------
@@ -419,8 +429,9 @@
   // ------------------------------------------------------------------
   const BULB_COLORS = ['#ff3b3b', '#ffd23f', '#2fd67a', '#3fa2ff', '#ff7ad9', '#ff9a2f'];
   const bulbPts = [];   // { p: Vector3, c: Color, ph }
-  const wirePts = [];   // 전선 — 전구 사이를 잇는 가는 선
-  function bulbLine(a, b, sag, n, colors = BULB_COLORS) {
+  const wirePts = [];
+  let STRANDS = 0;   // 가로등 → 트리 무지개 줄 개수   // 전선 — 전구 사이를 잇는 가는 선
+  function bulbLine(a, b, sag, n, colors = BULB_COLORS, strand = -1) {
     let prev = null;
     for (let i = 0; i <= n * 3; i++) {
       const t = i / (n * 3);
@@ -428,7 +439,7 @@
       p.y -= Math.sin(t * Math.PI) * sag;
       if (prev) wirePts.push(prev, p);
       prev = p;
-      if (i % 3 === 0) bulbPts.push({ p: p.clone().add(new THREE.Vector3(0, -0.06, 0)), c: new THREE.Color(colors[(i / 3) % colors.length]), ph: rnd() * 6.28 });
+      if (i % 3 === 0) bulbPts.push({ p: p.clone().add(new THREE.Vector3(0, -0.06, 0)), c: new THREE.Color(colors[(i / 3) % colors.length]), ph: rnd() * 6.28, strand, k: i / 3, n });
     }
   }
 
@@ -487,7 +498,7 @@
       imN.setMatrixAt(i, d.matrix); imS.setMatrixAt(i, d.matrix); imT.setMatrixAt(i, d.matrix);
       tint.setHSL(0.39 + rnd() * 0.04, 0.42, 0.24 + rnd() * 0.08);
       imN.setColorAt(i, tint);
-      if (Math.hypot(s.x, s.z) < 40) circleBlock(s.x, s.z, 0.7 * s.s).h = 5.5 * s.s;
+      if (Math.hypot(s.x, s.z) < 40) circleBlock(s.x, s.z, 1.35 * s.s).h = 5.5 * s.s;   // 머리 높이의 가지 폭 — 얼굴이 가지에 묻히지 않게
     });
     for (const im of [imN, imS, imT]) { im.castShadow = true; im.receiveShadow = true; scene.add(im); }
   }
@@ -558,56 +569,76 @@
     }
     circleBlock(0, 0, 4.6);   // 트리 + 아래 선물 더미
 
-    // 오너먼트 — 빨강 · 금 · 은 · 파랑 반짝이 공
+    // 층마다 보이는 부분에만 장식 — 위층 가지가 덮는 윗부분(위층 밑동 근처)은 피합니다.
+    //   (예전엔 나선으로 감아서 층마다 위층 가지 밑으로 들어가 줄이 끊겨 보였음)
+    const tierPos = (i, f, a, out = 0) => {
+      const t = TREE.tiers[i];
+      const r = t.r * (1 - f) + out;
+      return [Math.cos(a) * r, t.y + t.h * f, Math.sin(a) * r];
+    };
+    const fMax = (i) => (i < TREE.tiers.length - 1 ? (TREE.tiers[i + 1].y - TREE.tiers[i].y - 0.3) / TREE.tiers[i].h : 0.75);
+    const d = new THREE.Object3D();
+    // 오너먼트 — 빨강 · 금 · 은 · 파랑 반짝이 공 (층 둘레에 고르게)
     const ornCols = ['#d42a2a', '#f2b632', '#e9eef6', '#2d6fd6', '#d42a2a', '#f2b632'];
     const orn = [];
-    for (let i = 0; i < 110; i++) {
-      const y = 1.6 + Math.pow(rnd(), 0.85) * 8.4;
-      const a = rnd() * Math.PI * 2;
-      const r = treeRadiusAt(y);
-      if (r < 0.4) continue;
-      orn.push({ x: Math.cos(a) * (r + 0.05), y, z: Math.sin(a) * (r + 0.05), c: ornCols[i % ornCols.length], s: 0.13 + rnd() * 0.09 });
-    }
+    TREE.tiers.forEach((t, i) => {
+      const n = Math.round(t.r * 4.2);
+      for (let k = 0; k < n; k++) {
+        const a = (k + 0.5 + (rnd() - 0.5) * 0.4) / n * Math.PI * 2 + i * 0.7;
+        const f = 0.1 + rnd() * (fMax(i) - 0.16);
+        orn.push({ p: tierPos(i, f, a, 0.07), c: ornCols[(k + i) % ornCols.length], s: 0.13 + rnd() * 0.08 });
+      }
+    });
     const ornIM = new THREE.InstancedMesh(new THREE.SphereGeometry(1, 16, 12), new THREE.MeshStandardMaterial({ roughness: 0.18, metalness: 0.55, envMapIntensity: 1.4 }), orn.length);
-    const d = new THREE.Object3D();
     orn.forEach((o, i) => {
-      d.position.set(o.x, o.y, o.z); d.scale.setScalar(o.s); d.updateMatrix();
+      d.position.set(o.p[0], o.p[1], o.p[2]); d.scale.setScalar(o.s); d.updateMatrix();
       ornIM.setMatrixAt(i, d.matrix);
       ornIM.setColorAt(i, new THREE.Color(o.c));
     });
     ornIM.castShadow = true;
     g.add(ornIM);
 
-    // 금색 구슬 줄 (나선)
+    // 금색 구슬 줄 — 층마다 둘레를 한 바퀴, 고리 사이가 둥글게 늘어지는 모양(스왜그)
     const beads = [];
-    for (let i = 0; i < 420; i++) {
-      const s = i / 420, y = 1.5 + s * 9.0, a = s * Math.PI * 2 * 5.5 + 1.4;
-      const r = treeRadiusAt(y);
-      if (r < 0.2) continue;
-      beads.push([Math.cos(a) * (r + 0.04), y - 0.25 * Math.abs(Math.sin(a * 2.75)), Math.sin(a) * (r + 0.04)]);
-    }
-    const beadIM = new THREE.InstancedMesh(new THREE.SphereGeometry(0.055, 8, 6), new THREE.MeshStandardMaterial({ color: '#f6c94a', roughness: 0.2, metalness: 0.8 }), beads.length);
-    beads.forEach((b, i) => { d.position.set(b[0], b[1], b[2]); d.scale.setScalar(1); d.updateMatrix(); beadIM.setMatrixAt(i, d.matrix); });
+    TREE.tiers.forEach((t, i) => {
+      const scallops = Math.max(5, Math.round(t.r * 2.6));
+      const f0 = Math.min(0.32, fMax(i) * 0.62);
+      const n = Math.round(t.r * 2 * Math.PI / 0.1);
+      for (let k = 0; k < n; k++) {
+        const u = k / n, a = u * Math.PI * 2 + i * 0.4;
+        const sag = Math.sin(((u * scallops) % 1) * Math.PI);   // 고리 사이에서 아래로 처짐
+        const f = Math.max(0.05, f0 - sag * 0.2 * (1.6 / t.h));
+        beads.push(tierPos(i, f, a, 0.05));
+      }
+    });
+    const beadIM = new THREE.InstancedMesh(new THREE.SphereGeometry(0.05, 8, 6), new THREE.MeshStandardMaterial({ color: '#f6c94a', roughness: 0.2, metalness: 0.8 }), beads.length);
+    beads.forEach((p, i) => { d.position.set(p[0], p[1], p[2]); d.scale.setScalar(1); d.updateMatrix(); beadIM.setMatrixAt(i, d.matrix); });
     g.add(beadIM);
 
-    // 전구 (나선) — 색을 매 프레임 바꿔 반짝이게
+    // 전구 — 층마다 가지 끝 둘레 한 줄 + 위쪽 한 줄, 끊김 없이 고르게 (색은 매 프레임 바꿈)
     const bl = [];
-    for (let i = 0; i < 340; i++) {
-      const s = i / 340, y = 1.45 + s * 9.2, a = -s * Math.PI * 2 * 7;
-      const r = treeRadiusAt(y);
-      if (r < 0.2) continue;
-      bl.push([Math.cos(a) * (r + 0.08), y, Math.sin(a) * (r + 0.08)]);
-    }
-    const bulbIM = new THREE.InstancedMesh(new THREE.SphereGeometry(0.085, 10, 8), new THREE.MeshBasicMaterial({ toneMapped: false }), bl.length);
+    TREE.tiers.forEach((t, i) => {
+      for (const f of [0.07, fMax(i) * 0.82]) {
+        const r = t.r * (1 - f);
+        const n = Math.max(8, Math.round(r * 2 * Math.PI / 0.36));
+        for (let k = 0; k < n; k++) bl.push(tierPos(i, f, (k / n) * Math.PI * 2 + i * 0.3 + f * 3, 0.09));
+      }
+    });
+    const bulbIM = new THREE.InstancedMesh(new THREE.SphereGeometry(0.08, 10, 8), new THREE.MeshBasicMaterial({ toneMapped: false }), bl.length);
+    const glowPos = [], glowPh = [];
     bl.forEach((b, i) => {
-      d.position.set(b[0], b[1], b[2]); d.updateMatrix();
+      d.position.set(b[0], b[1], b[2]); d.scale.setScalar(1); d.updateMatrix();
       bulbIM.setMatrixAt(i, d.matrix);
       const c = new THREE.Color(BULB_COLORS[i % BULB_COLORS.length]);
       bulbIM.setColorAt(i, c);
-      TREE.bulbBase.push({ c, ph: rnd() * 6.28, y: b[1] });
+      const ph = rnd() * 6.28;
+      TREE.bulbBase.push({ c, ph, y: b[1] });
+      glowPos.push(b[0], b[1], b[2]); glowPh.push(ph);
     });
     g.add(bulbIM);
     TREE.bulbs = bulbIM;
+    TREE.glowPts = makeGlowPoints(glowPos, bl.map((_, i) => BULB_COLORS[i % BULB_COLORS.length]), glowPh, 0.5, false);
+    g.add(TREE.glowPts.points);
 
     // 별
     const sh = new THREE.Shape();
@@ -658,6 +689,42 @@
     }
   }
 
+  // 전구 빛무리 — 전구마다 부드러운 빛 번짐. twinkle=true 면 셰이더가 직접 숨 쉬듯 · 가끔 깜빡 (JS 의 bulbTwinkle 과 같은 식)
+  function makeGlowPoints(pos, colors, phases, size, twinkle) {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    const col = new Float32Array(colors.length * 3);
+    colors.forEach((c, i) => { tmpC0.set(c); col[i * 3] = tmpC0.r; col[i * 3 + 1] = tmpC0.g; col[i * 3 + 2] = tmpC0.b; });
+    const colAttr = new THREE.BufferAttribute(col, 3);
+    geo.setAttribute('aCol', colAttr);
+    geo.setAttribute('aPh', new THREE.Float32BufferAttribute(phases, 1));
+    const mt = new THREE.ShaderMaterial({
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+      uniforms: { uTime: { value: 0 }, uSize: { value: size * DPR }, uTw: { value: twinkle ? 1 : 0 } },
+      vertexShader: `uniform float uTime; uniform float uSize; uniform float uTw; attribute vec3 aCol; attribute float aPh; varying vec3 vCol; varying float vA;
+        void main(){
+          vec4 mv = modelViewMatrix * vec4(position, 1.0);
+          gl_Position = projectionMatrix * mv;
+          float tw = 0.5 + 0.5 * sin(uTime * 1.7 + aPh);
+          float blink = step(0.94, sin(uTime * 0.6 + aPh * 3.0));
+          vA = mix(0.55, (0.2 + 0.7 * tw * tw) * (1.0 - 0.7 * blink), uTw);
+          vCol = aCol;
+          gl_PointSize = uSize * (300.0 / -mv.z) * mix(1.0, 0.75 + 0.45 * tw, uTw);
+        }`,
+      fragmentShader: `varying vec3 vCol; varying float vA;
+        void main(){ float d = length(gl_PointCoord - 0.5); float a = pow(smoothstep(0.5, 0.0, d), 1.6) * vA;
+          gl_FragColor = vec4(vCol * 1.15, a); }`,
+    });
+    const points = new THREE.Points(geo, mt);
+    glowMats.push(mt);
+    return { points, colAttr };
+  }
+  // 줄 전구 깜빡임 — 셰이더와 같은 식 (전구 알과 빛무리가 함께 숨 쉬게)
+  const bulbTwinkle = (t, ph) => {
+    const tw = 0.5 + 0.5 * Math.sin(t * 1.7 + ph);
+    const blink = Math.sin(t * 0.6 + ph * 3) >= 0.94 ? 1 : 0;
+    return (0.2 + 0.7 * tw * tw) * (1 - 0.7 * blink);
+  };
   function makeGift(w, h, dd, color, ribbon) {
     const g = new THREE.Group();
     const box = mesh(new THREE.BoxGeometry(w, h, dd), mat(color, { roughness: 0.55 }), 0, h / 2, 0);
@@ -820,15 +887,16 @@
   const INT = { x: 1000, z: 0, W: 11, D: 9, H: 4.2 };
   const HOUSE_LIST = [], doorMeshes = [], stationMeshes = [];
   const HOUSE_NAMES = ['생강쿠키 집', '하늘색 집', '크림색 집', '분홍 집', '민트색 집', '노란 집', '눈꽃 집', '통나무 집'];
-  function registerHouse(house, name, wall, workshop = false) {
+  function registerHouse(house, name, wall, workshop = false, theme = 'living') {
     const { d } = house.userData.size;
     const h = {
-      g: house, name, wall, workshop, door: house.userData.door, doorT: 0, ry: house.rotation.y, doorColor: house.userData.doorColor,
+      g: house, name, wall, workshop, theme: workshop ? 'workshop' : theme, door: house.userData.door, doorT: 0, ry: house.rotation.y, doorColor: house.userData.doorColor,
       doorSpot: house.localToWorld(new THREE.Vector3(0, 0, d / 2 + 1.0)), doorLook: house.localToWorld(new THREE.Vector3(0, 0, d / 2)),
     };
     h.doorSpot.y = 0;
-    h.place = { id: 'door' + HOUSE_LIST.length, emoji: '🚪', name, house: h,
-      desc: workshop ? '산타가 준비한 선물이 가득한 공방이에요. 문을 열고 들어가 둘러볼까요?' : '창문 너머로 따뜻한 불빛이 보여요. 똑똑, 들어가 볼까요?' };
+    const TH = !workshop && THEMES[theme];
+    h.place = { id: 'door' + HOUSE_LIST.length, emoji: '🚪', name: TH ? `${name} · ${TH.name}` : name, house: h,
+      desc: workshop ? '산타가 준비한 선물이 가득한 공방이에요. 문을 열고 들어가 둘러볼까요?' : TH ? TH.door : '창문 너머로 따뜻한 불빛이 보여요. 똑똑, 들어가 볼까요?' };
     house.userData.doorPanel.userData.house = h;
     doorMeshes.push(house.userData.doorPanel);
     HOUSE_LIST.push(h);
@@ -852,7 +920,7 @@
   const fireFlames = [];
   let fireGlow = null, fireLight = null, winFlakes = null, intDoor = null, intDoorT = 0;
   const intTreeBulbs = [];
-  let intTreeOn = true, intTreeHalo = null;
+  let intTreeOn = true, intTreeHalo = null, intTreeLevel = 0;   // 들어올 때마다 아래부터 차례로 은은하게 켜짐 (끌 수도 있음)
   const cookies = [];
   const INTS = {}, WALLS = {};
   let shopBanner = null;
@@ -889,7 +957,7 @@
     WALLS.right.add(mesh(new THREE.BoxGeometry(0.2, H, D), intWallMat, W / 2 + 0.1, H / 2, 0));
     [[W, 0.06, 0, -D / 2 + 0.03, 'back'], [W, 0.06, 0, D / 2 - 0.03, 'front'], [0.06, D, -W / 2 + 0.03, 0, 'left'], [0.06, D, W / 2 - 0.03, 0, 'right']].forEach(([w, d, x, z, k]) => {
       WALLS[k].add(mesh(new THREE.BoxGeometry(w, 1.1, d), green, x, 0.55, z));
-      WALLS[k].add(mesh(new THREE.BoxGeometry(w, 0.08, d + 0.06), whiteM, x, 1.12, z));
+      WALLS[k].add(mesh(new THREE.BoxGeometry(w + (w < 1 ? 0.06 : 0), 0.08, d + (d < 1 ? 0.06 : 0)), whiteM, x, 1.12, z));   // 벽판보다 두껍게 (같은 두께면 면이 겹쳐 깜빡임)
     });
     R.add(mesh(new THREE.BoxGeometry(W + 0.4, 0.2, D + 0.4), mat('#fbf3e6', { roughness: 0.9 }), 0, H + 0.1, 0));
     for (const z of [-2.8, 0, 2.8]) R.add(mesh(new THREE.BoxGeometry(W, 0.24, 0.3), wood, 0, H - 0.1, z));
@@ -901,6 +969,7 @@
     const lamp = new THREE.PointLight('#ffe2b8', 10, 16, 1.1);
     lamp.position.set(0, H - 0.9, 0.6);
     R.add(lamp);
+    INTS.lamp = lamp;
 
     // 벽난로
     const brickTex = canvasTex(128, (g, S) => {
@@ -975,15 +1044,24 @@
     // 구석 트리
     const tg = new THREE.Group();
     tg.position.set(-W / 2 + 1.3, 0, -D / 2 + 1.3);
+    INTS.cornerTree = tg;
     R.add(tg);
     tg.add(mesh(new THREE.CylinderGeometry(0.35, 0.3, 0.4, 14), mat('#c0302c', { roughness: 0.5 }), 0, 0.2, 0));
     for (let i = 0; i < 4; i++) {
       const r = 1.05 - i * 0.24, h = 1.0 - i * 0.12, y = 0.35 + i * 0.6;
       tg.add(mesh(new THREE.ConeGeometry(r, h, 12), new THREE.MeshStandardMaterial({ color: '#2b7547', roughness: 0.8, flatShading: true }), 0, y + h / 2, 0));
     }
-    for (let k = 0; k < 34; k++) {
-      const t = k / 34, y = 0.5 + t * 2.3, a = t * Math.PI * 2 * 3.5;
-      const r = 1.0 * (1 - t * 0.78) + 0.05;
+    // 전구는 층마다 가지 표면 둘레에 (위층이 덮는 윗부분은 피해서) — 예전엔 나선이 트리 모양과 안 맞아 떠 있었음
+    const smallBulbs = [];
+    for (let i = 0; i < 4; i++) {
+      const tr = 1.05 - i * 0.24, th = 1.0 - i * 0.12, ty = 0.35 + i * 0.6;
+      for (const f of i < 3 ? [0.1, 0.42] : [0.1, 0.45, 0.72]) {
+        const n = Math.max(5, Math.round(tr * (1 - f) * 2 * Math.PI / 0.28));
+        for (let j = 0; j < n; j++) smallBulbs.push([tr * (1 - f) + 0.035, ty + th * f, (j / n) * Math.PI * 2 + i * 0.5 + f * 4]);
+      }
+    }
+    for (let k = 0; k < smallBulbs.length; k++) {
+      const [r, y, a] = smallBulbs[k];
       const b = new THREE.Mesh(new THREE.SphereGeometry(0.05, 8, 6), new THREE.MeshBasicMaterial({ color: BULB_COLORS[k % 6], toneMapped: false }));
       b.position.set(Math.cos(a) * r, y, Math.sin(a) * r);
       b.userData.base = new THREE.Color(BULB_COLORS[k % 6]);
@@ -1003,7 +1081,7 @@
     for (const [x, z, c1, c2] of [[0.7, 0.6, '#d63a3a', '#f4d35e'], [-0.2, 0.9, '#3a6fd6', '#ffffff'], [0.9, -0.2, '#f4d35e', '#2f8a52']]) {
       const gg = makeGift(0.5, 0.4, 0.5, c1, c2); gg.position.set(x, 0, z); gg.rotation.y = x; tg.add(gg);
     }
-    circleBlock(INT.x - W / 2 + 1.3, INT.z - D / 2 + 1.3, 1.2);
+    INTS.cornerBlock = circleBlock(INT.x - W / 2 + 1.3, INT.z - D / 2 + 1.3, 1.2);
 
     // 양옆 창문 — 바깥 눈 내리는 풍경 (눈송이 그림이 아래로 흘러갑니다)
     const viewTex = canvasTex(128, (g, S) => {
@@ -1072,21 +1150,24 @@
     const plaid = stripeTex('#2f8a52', '#f6efe4', 6, false);
     for (const x of [-0.95, 0.95]) { const pl = mesh(new THREE.BoxGeometry(0.46, 0.42, 0.15), new THREE.MeshStandardMaterial({ map: plaid, roughness: 0.95 }), x, 0.88, 0.2); pl.rotation.set(-0.2, 0, x * 0.15); sofa.add(pl); }
     homeBlocks.push(boxBlock(INT.x, INT.z + 1.5, 1.45, 0.5, 0));
-    INTS.seats = [new THREE.Vector3(INT.x - 0.6, 0, INT.z + 1.45), new THREE.Vector3(INT.x + 0.6, 0, INT.z + 1.45)];
+    INTS.seats = [new THREE.Vector3(INT.x - 0.6, 0, INT.z + 1.22), new THREE.Vector3(INT.x + 0.6, 0, INT.z + 1.22)];   // 쿠션 앞쪽 — 무릎이 소파 앞으로 나오게
     const tb = new THREE.Group();
-    tb.position.set(0, 0, -0.5);
+    tb.position.set(0, 0, 0.3);   // 소파 바로 앞 — 앉은 채로 손이 닿게
     homeStuff.add(tb);
     tb.add(mesh(new THREE.BoxGeometry(1.3, 0.08, 0.7), wood, 0, 0.45, 0));
     for (const sx of [-0.55, 0.55]) for (const sz of [-0.27, 0.27]) tb.add(mesh(new THREE.CylinderGeometry(0.04, 0.04, 0.42, 8), wood, sx, 0.21, sz));
-    tb.add(mesh(new THREE.CylinderGeometry(0.24, 0.2, 0.03, 20), whiteM, -0.25, 0.505, 0));
-    for (let i = 0; i < 5; i++) {
-      const ck = mesh(new THREE.CylinderGeometry(0.07, 0.07, 0.025, 14), mat('#c98a4b', { roughness: 0.9 }), -0.25 + (i === 4 ? 0 : Math.cos(i * 1.57) * 0.11), 0.535 + (i === 4 ? 0.026 : 0), i === 4 ? 0 : Math.sin(i * 1.57) * 0.11);
-      tb.add(ck);
-      cookies.push(ck);
+    // 두 자리 앞에 접시 하나씩 (쿠키 3개씩) · 가운데 우유
+    for (const sd of [-1, 1]) {
+      tb.add(mesh(new THREE.CylinderGeometry(0.2, 0.17, 0.03, 20), whiteM, sd * 0.42, 0.505, 0.12));
+      for (let i = 0; i < 3; i++) {
+        const ck = mesh(new THREE.CylinderGeometry(0.065, 0.065, 0.025, 14), mat('#c98a4b', { roughness: 0.9 }), sd * 0.42 + (i - 1) * 0.1, 0.535 + (i === 1 ? 0.02 : 0), 0.12 + (i === 1 ? -0.03 : 0.03));
+        ck.userData.side = sd;
+        tb.add(ck);
+        cookies.push(ck);
+      }
     }
-    tb.add(mesh(new THREE.CylinderGeometry(0.065, 0.058, 0.22, 14), mat('#fdfdfb', { roughness: 0.3 }), 0.25, 0.6, 0));
-    homeBlocks.push(boxBlock(INT.x, INT.z - 0.5, 0.65, 0.35, 0));
-    INTS.table = new THREE.Vector3(INT.x + 1.3, 0, INT.z - 0.5);
+    tb.add(mesh(new THREE.CylinderGeometry(0.065, 0.058, 0.22, 14), mat('#fdfdfb', { roughness: 0.3 }), 0, 0.6, -0.1));
+    homeBlocks.push(boxBlock(INT.x, INT.z + 0.3, 0.65, 0.35, 0));
     const shelf = new THREE.Group();
     shelf.position.set(W / 2 - 0.3, 0, 2.9);
     shelf.rotation.y = -Math.PI / 2;
@@ -1121,9 +1202,6 @@
       const item = models[i]();
       item.position.y = 0.85;
       st.add(item);
-      const lb = makeLabel(`${it.emoji} ${it.name}`, { size: 34, scale: 0.5 });
-      lb.position.y = 1.85;
-      st.add(lb);
       const spark = new THREE.Sprite(new THREE.SpriteMaterial({ map: softTex, color: '#fff2b0', transparent: true, opacity: 0.45, depthWrite: false, blending: THREE.AdditiveBlending }));
       spark.scale.setScalar(1.2); spark.position.y = 1.15;
       st.add(spark);
@@ -1227,11 +1305,1459 @@
     g.add(body);
     return g;
   }
+
+  // ------------------------------------------------------------------
+  // 집마다 다른 방 — 방(ROOM)은 하나지만 집마다 테마 가구 묶음과 할 일을 바꿔 보여 줍니다
+  //   생강쿠키=쿠키 부엌 · 하늘색=장난감 방 · 크림색=벽난로 거실 · 분홍=편지 방
+  //   민트색=트리 꾸미기 방 · 노란=음악실 · 눈꽃=침실 · 통나무=선물 포장실 (공방은 따로)
+  //   좌표는 방 기준 (x: -5.5~5.5, z: -4.5~4.5, 문은 z=+4.5 가운데, 벽난로는 뒤 가운데, 구석 트리는 왼쪽 뒤)
+  // ------------------------------------------------------------------
+  const THEMES = {};
+  const HOUSE_THEMES = ['kitchen', 'toy', 'living', 'letter', 'deco', 'music', 'bed', 'wrap'];
+  let curTheme = null;
+  const roomV = (x, z) => new THREE.Vector3(INT.x + x, 0, INT.z + z);
+  const toRoom = (v) => v.clone().sub(ROOM.position);
+  function defTheme(id, def) {
+    def.id = id;
+    def.g = new THREE.Group();
+    def.g.visible = false;
+    def.blocks = [];
+    ROOM.add(def.g);
+    def.box = (x, z, hw, hd) => { const b = boxBlock(INT.x + x, INT.z + z, hw, hd, 0); b.off = true; def.blocks.push(b); return b; };
+    def.circ = (x, z, r) => { const b = circleBlock(INT.x + x, INT.z + z, r); b.off = true; def.blocks.push(b); return b; };
+    THEMES[id] = def;
+    if (def.build) def.build(def.g, def);
+    return def;
+  }
+  const tWood = new THREE.MeshStandardMaterial({ map: woodTex, roughness: 0.7 });
+  // 떠오르는 글자 (♪ · Zzz)
+  const floaters = [];
+  function floatText(pos, text, color = '#7a3bd6') {
+    const l = makeLabel(text, { size: 46, scale: 0.55, color, bg: 'rgba(255,255,255,0)' });
+    l.position.copy(pos);
+    scene.add(l);
+    floaters.push({ s: l, t: 0, vx: (Math.random() - 0.5) * 0.35 });
+  }
+  function updateFloaters(dt) {
+    for (let i = floaters.length - 1; i >= 0; i--) {
+      const f = floaters[i];
+      f.t += dt;
+      f.s.position.y += dt * 0.55;
+      f.s.position.x += f.vx * dt;
+      f.s.material.opacity = Math.max(0, 1 - f.t / 2.2);
+      if (f.t > 2.2) { scene.remove(f.s); f.s.material.map.dispose(); f.s.material.dispose(); floaters.splice(i, 1); }
+    }
+  }
+  // 테마 자리에 앉기 · 눕기 — 일어나면 standSpot 으로, cleanup 실행
+  let onStand = null;
+  function sitThemed(kind, pos, ry, y, standSpot, cleanup) {
+    sitting = kind;
+    moveTarget = null;
+    player.position.set(pos.x, y, pos.z);
+    player.rotation.y = targetYaw = ry;
+    player.userData.pose = 'sit';
+    player.userData.standSpot = standSpot.clone();
+    onStand = cleanup || null;
+    refreshPanel(true);
+  }
+  // 손에 든 걸 입으로 — 컵 마시기 동작을 빌려 씀
+  function munch(src) {
+    const u = player.userData;
+    takeCup(player);
+    const hand = mesh(src.geometry, src.material);
+    hand.rotation.x = Math.PI / 2;
+    hand.position.set(0, -0.31, 0.06);
+    u.arms[1].elbow.add(hand);
+    u.cup = hand; u.cupNoSteam = true; u.drink = 3.3;
+    setTimeout(() => {
+      u.head.getWorldPosition(tmpV);
+      puff(tmpV.clone().add(new THREE.Vector3(Math.sin(player.rotation.y) * 0.25, -0.15, Math.cos(player.rotation.y) * 0.25)), { n: 7, color: '#c98a4b', size: 0.07, up: -0.6, spread: 0.35, life: 0.8, opacity: 0.9 });
+      for (let i = 0; i < 4; i++) noiseHit({ freq: 2200, q: 0.8, vol: 0.05, dur: 0.05, when: i * 0.16 });
+    }, 450);
+    setTimeout(() => { u.cupNoSteam = false; }, 1500);
+  }
+
+  // ---------- 벽난로 거실 (기존 소파 · 쿠키 · 벽난로 — homeStuff 를 그대로 씀)
+  defTheme('living', {
+    name: '벽난로 거실', emoji: '🛋',
+    door: '창문 너머로 벽난로 불빛이 보여요. 똑똑, 들어가 볼까요?',
+    desc: '벽난로가 타닥타닥. 소파에 앉아 쿠키를 먹고, 트리 불을 밝혀 봐요.',
+  });
+
+  // ---------- 쿠키 굽는 부엌
+  const cookieRaw = mat('#e2b97e', { roughness: 0.95 }), cookieBaked = mat('#c27a3e', { roughness: 0.9 });
+  const cookieGeos = (() => {
+    const star = new THREE.Shape();
+    for (let i = 0; i < 10; i++) { const a = Math.PI / 2 + (i / 10) * Math.PI * 2, r = i % 2 ? 0.045 : 0.1; if (i) star.lineTo(Math.cos(a) * r, Math.sin(a) * r); else star.moveTo(Math.cos(a) * r, Math.sin(a) * r); }
+    const tree = new THREE.Shape();
+    tree.moveTo(0, 0.11); tree.lineTo(0.09, -0.05); tree.lineTo(0.03, -0.05); tree.lineTo(0.03, -0.1); tree.lineTo(-0.03, -0.1); tree.lineTo(-0.03, -0.05); tree.lineTo(-0.09, -0.05); tree.lineTo(0, 0.11);
+    const out = [star, tree].map((sh) => new THREE.ExtrudeGeometry(sh, { depth: 0.025, bevelEnabled: false }).rotateX(-Math.PI / 2));
+    out.push(new THREE.CylinderGeometry(0.08, 0.08, 0.025, 16).translate(0, 0.0125, 0));
+    return out;
+  })();
+  defTheme('kitchen', {
+    name: '쿠키 굽는 부엌', emoji: '🍪',
+    door: '달콤한 냄새가 솔솔… 쿠키 굽는 부엌이에요. 들어가 볼까요?',
+    desc: '조리대 반죽을 별 · 트리 모양으로 찍고, 오븐에 구워 먹어 봐요.',
+    build(g, T) {
+      g.add(mesh(new THREE.BoxGeometry(0.9, 0.9, 4.2), mat('#7a9e86', { roughness: 0.7 }), 4.95, 0.45, -0.5));
+      g.add(mesh(new THREE.BoxGeometry(1.0, 0.08, 4.3), mat('#f6f1e8', { roughness: 0.5 }), 4.92, 0.94, -0.5));
+      for (let k = 0; k < 4; k++) g.add(mesh(new THREE.SphereGeometry(0.035, 8, 6), mat('#e8b23a', { metalness: 0.7, roughness: 0.3 }), 4.48, 0.62, -2.2 + k * 1.1));
+      T.box(4.95, -0.5, 0.45, 2.1);
+      g.add(mesh(new THREE.BoxGeometry(0.6, 0.04, 0.8), tWood, 4.85, 1.0, 0.75));
+      g.add(mesh(new THREE.BoxGeometry(0.5, 0.03, 0.7), cookieRaw, 4.85, 1.035, 0.75));
+      const pin = mesh(new THREE.CylinderGeometry(0.045, 0.045, 0.6, 10), tWood, 4.62, 1.08, 1.3);
+      pin.rotation.x = Math.PI / 2;
+      g.add(pin);
+      for (let k = 0; k < 3; k++) { const cut = mesh(cookieGeos[k], mat('#d9dde2', { metalness: 0.8, roughness: 0.3 }), 4.7 + k * 0.12, 0.98, 1.5 + (k % 2) * 0.1); cut.scale.setScalar(1.3); g.add(cut); }
+      // 밀가루 통 · 우유병
+      g.add(mesh(new THREE.CylinderGeometry(0.14, 0.14, 0.3, 14), mat('#ffffff', { roughness: 0.6 }), 4.95, 1.13, 1.95));
+      g.add(mesh(new THREE.CylinderGeometry(0.07, 0.07, 0.3, 12), mat('#fdfdfb', { roughness: 0.3 }), 5.05, 1.13, -2.2));
+      T.tray = new THREE.Group();
+      T.tray.position.set(4.85, 1.0, -0.55);
+      g.add(T.tray);
+      T.tray.add(mesh(new THREE.BoxGeometry(0.62, 0.03, 0.82), mat('#b9bfc7', { metalness: 0.6, roughness: 0.35 })));
+      T.trayHome = T.tray.position.clone();
+      T.trayOven = new THREE.Vector3(4.95, 0.62, -3.4);
+      // 오븐
+      g.add(mesh(new THREE.BoxGeometry(1.0, 1.3, 1.1), mat('#c0392b', { roughness: 0.45 }), 4.95, 0.65, -3.4));
+      g.add(mesh(new THREE.BoxGeometry(1.05, 0.08, 1.15), mat('#2b2b33'), 4.95, 1.34, -3.4));
+      T.ovenGlow = new THREE.MeshStandardMaterial({ color: '#3a2a24', emissive: '#ff8a2a', emissiveIntensity: 0, roughness: 0.2 });
+      g.add(mesh(new THREE.BoxGeometry(0.04, 0.5, 0.7), T.ovenGlow, 4.43, 0.6, -3.4));
+      const hd = mesh(new THREE.CylinderGeometry(0.025, 0.025, 0.6, 8), mat('#d9dde2', { metalness: 0.8, roughness: 0.3 }), 4.38, 0.95, -3.4);
+      hd.rotation.x = Math.PI / 2;
+      g.add(hd);
+      for (let k = 0; k < 3; k++) { const kn = mesh(new THREE.CylinderGeometry(0.05, 0.05, 0.04, 12), mat('#2b2b33'), 4.43, 1.17, -3.65 + k * 0.25); kn.rotation.z = Math.PI / 2; g.add(kn); }
+      T.ovenLight = new THREE.PointLight('#ff9a3c', 0, 3, 1.5);
+      T.ovenLight.position.set(4.1, 0.6, -3.4);
+      g.add(T.ovenLight);
+      T.box(4.95, -3.4, 0.5, 0.55);
+      // 식탁 · 쿠키 병 · 의자
+      g.add(mesh(new THREE.CylinderGeometry(0.75, 0.75, 0.06, 24), tWood, -2.6, 0.78, 1.4));
+      g.add(mesh(new THREE.CylinderGeometry(0.08, 0.12, 0.76, 10), tWood, -2.6, 0.38, 1.4));
+      g.add(mesh(new THREE.CylinderGeometry(0.16, 0.16, 0.3, 16), new THREE.MeshStandardMaterial({ color: '#e8f4ff', transparent: true, opacity: 0.5, roughness: 0.05 }), -2.5, 0.96, 1.3));
+      for (let k = 0; k < 4; k++) { const c = mesh(cookieGeos[2], cookieBaked, -2.5 + (k % 2) * 0.06, 0.84 + k * 0.05, 1.3); g.add(c); }
+      g.add(mesh(new THREE.BoxGeometry(0.5, 0.04, 0.35), mat('#d63a3a', { roughness: 0.9 }), -2.75, 0.82, 1.65));
+      for (const x of [-3.55, -1.65]) { g.add(mesh(new THREE.BoxGeometry(0.45, 0.06, 0.45), tWood, x, 0.48, 1.4)); g.add(mesh(new THREE.BoxGeometry(0.06, 0.55, 0.45), tWood, x + (x < -2.6 ? -0.2 : 0.2), 0.75, 1.4)); for (const sx of [-0.18, 0.18]) for (const sz of [-0.18, 0.18]) g.add(mesh(new THREE.BoxGeometry(0.04, 0.46, 0.04), tWood, x + sx, 0.23, 1.4 + sz)); }
+      T.circ(-2.6, 1.4, 1.25);
+      T.plate = new THREE.Group(); T.plate.position.set(-2.85, 0.82, 1.4); g.add(T.plate);
+      T.plate.add(mesh(new THREE.CylinderGeometry(0.22, 0.18, 0.03, 20), whiteM));
+      g.add(mesh(new THREE.CylinderGeometry(0.06, 0.055, 0.18, 12), mat('#fdfdfb', { roughness: 0.3 }), -2.65, 0.9, 1.65));
+      T.chairPos = roomV(-3.55, 1.4); T.chairStand = roomV(-3.55, 2.75);
+      // 앞치마 걸이
+      g.add(mesh(new THREE.BoxGeometry(0.02, 0.7, 0.45), mat('#ff8fb1', { roughness: 0.95 }), 5.42, 1.7, 1.7));
+      T.cuts = []; T.baked = false; T.baking = 0; T.trayAnim = null;
+      T.counter = roomV(4.1, 0.75); T.counterLook = roomV(5, 0.75);   // 반죽 판 바로 앞
+      T.oven = roomV(3.8, -3.0); T.ovenLook = roomV(5, -3.4);
+    },
+    actions(T) {
+      if (T.baking > 0 || T.trayAnim) return [['⏳ 굽는 중…', () => toast('🔥 노릇노릇 굽는 중이에요')]];
+      if (T.baked) return [[`🍪 식탁에 앉아 쿠키 먹기 (${T.cuts.length})`, () => kitchenEat(T)]];
+      const a = [];
+      if (T.cuts.length < 6) a.push([`⭐ 반죽 모양 찍기 (${T.cuts.length}/6)`, () => kitchenCut(T)]);
+      if (T.cuts.length) a.push(['🔥 오븐에 굽기', () => kitchenBake(T)]);
+      return a;
+    },
+    sitActions(T) { return T.cuts.length ? [[`🍪 쿠키 먹기 (${T.cuts.length})`, () => kitchenEat(T)]] : []; },
+    update(T, dt, t) {
+      if (T.trayAnim) {
+        const A = T.trayAnim;
+        A.t += dt;
+        const k = smooth(0, 0.9, A.t);
+        T.tray.position.lerpVectors(A.from, A.to, k);
+        T.tray.position.y += Math.sin(k * Math.PI) * 0.25;
+        if (A.t > 0.95) { T.trayAnim = null; if (A.done) A.done(); }
+      }
+      if (T.baking > 0 && !T.trayAnim) {
+        const before = T.baking;
+        T.baking -= dt;
+        if (Math.floor(before) !== Math.floor(T.baking)) tone(1318, 0.015, 0.15);
+        for (const c of T.cuts) c.material = T.baking < 1.8 ? cookieBaked : cookieRaw;
+        if (T.baking <= 0) {
+          T.baking = 0;
+          tone(1568, 0.08, 1.6); tone(2093, 0.05, 1.8, 0.05);
+          T.g.updateMatrixWorld(true);
+          puff(T.g.localToWorld(new THREE.Vector3(4.3, 1.1, -3.4)), { n: 10, size: 0.4, up: 0.8, spread: 0.4, life: 1.6, opacity: 0.6 });
+          T.trayAnim = { t: 0, from: T.tray.position.clone(), to: T.trayHome.clone(), done: () => {
+            // 다 구운 쿠키는 식탁 접시로 — 식탁에 앉아 우유랑 먹어요
+            T.cuts.forEach((c, k) => { T.tray.remove(c); c.position.set((k % 3 - 1) * 0.1, 0.02 + Math.floor(k / 3) * 0.03, (Math.floor(k / 3) - 0.5) * 0.1); T.plate.add(c); });
+            T.baked = true; toast('🍪 띵! 다 구워서 식탁 접시에 담았어요'); refreshPanel(true);
+          } };
+          refreshPanel(true);
+        }
+      }
+      const glow = T.baking > 0 ? 0.9 + Math.sin(t * 7) * 0.1 : 0;
+      T.ovenGlow.emissiveIntensity = lerp(T.ovenGlow.emissiveIntensity, glow, Math.min(1, dt * 3));
+      T.ovenLight.intensity = T.ovenGlow.emissiveIntensity * 4;
+    },
+  });
+  function kitchenCut(T) {
+    walkThen(T.counter, () => {
+      faceTo(player, T.counterLook);
+      faceCam(1.35, 4.2, 0.4);
+      player.userData.gesture = { type: 'press', t: 0, dur: 1.0 };   // 허리 숙여 두 손으로 반죽 위 틀을 꾹꾹
+      setTimeout(() => {
+        const k = T.cuts.length;
+        if (k >= 6 || T.baked) return;
+        const c = mesh(cookieGeos[k % 3], cookieRaw);
+        c.position.set(4.73 + (k % 2) * 0.23, 1.053, 0.52 + Math.floor(k / 2) * 0.22);   // 반죽 판 위, 찍은 그 자리
+        c.rotation.y = (rnd() - 0.5) * 0.6;
+        T.g.add(c);
+        T.cuts.push(c);
+        T.g.updateMatrixWorld(true);
+        puff(T.g.localToWorld(new THREE.Vector3(4.85, 1.1, 0.75)), { n: 5, size: 0.15, up: 0.4, spread: 0.3, life: 0.8, opacity: 0.7 });
+        noiseHit({ freq: 900, q: 1.2, vol: 0.06, dur: 0.06 }); tone(880, 0.03, 0.3);
+        toast(`${['⭐ 별', '🎄 트리', '⚪ 동그라미'][k % 3]} 쿠키 반죽! (${k + 1}/6)`);
+        refreshPanel(true);
+      }, 450);
+    });
+  }
+  function kitchenBake(T) {
+    walkThen(T.oven, () => {
+      faceTo(player, T.ovenLook);
+      faceCam(1.5, 5, 0.3);
+      player.userData.gesture = { type: 'reach', t: 0, dur: 1.0 };
+      creak();
+      T.cuts.forEach((c, k) => { T.g.remove(c); c.position.set(-0.15 + (k % 2) * 0.3, 0.02, -0.26 + Math.floor(k / 2) * 0.26); T.tray.add(c); });
+      T.baking = 4.5;
+      T.trayAnim = { t: 0, from: T.tray.position.clone(), to: T.trayOven.clone() };
+      toast('🔥 오븐에 넣었어요. 노릇노릇 구워지는 중…');
+      refreshPanel(true);
+    });
+  }
+  function kitchenEat(T) {
+    const eat = () => {
+      const u = player.userData;
+      if (u.eating) return;
+      u.eating = true;
+      faceCam(0.7, 3.8, 0.3);
+      u.gesture = { type: 'reach', t: 0, dur: 0.8 };
+      setTimeout(() => {
+        u.eating = false;
+        const c = T.cuts.pop();
+        if (!c) return;
+        T.plate.remove(c);
+        munch(c);
+        if (!T.cuts.length) { T.baked = false; toast('🍪 다 먹었어요! 또 구워 볼까요?'); } else toast('🍪 바삭바삭, 우유랑 냠냠!');
+        refreshPanel(true);
+      }, 450);
+    };
+    if (sitting === 'kchair') { eat(); return; }
+    walkThen(T.chairStand, () => {
+      sitThemed('kchair', T.chairPos, Math.PI / 2, 0.09, T.chairStand);
+      setTimeout(eat, 300);
+    });
+  }
+
+
+  // ---------- 장난감 방
+  const BLOCK_COLS = ['#d63a3a', '#f4d35e', '#3a6fd6', '#2f8a52', '#ff8fb1', '#9b59b6'];
+  defTheme('toy', {
+    name: '장난감 방', emoji: '🧸',
+    door: '안에서 칙칙폭폭 소리가 나요. 장난감 방이에요!',
+    desc: '기차를 출발시키고, 팽이를 돌리고, 블록을 높이 쌓아 봐요.',
+    build(g, T) {
+      const rx = 2.5, rz = 1.35, cx = 0.4, cz = 0.6;
+      T.track = { rx, rz, cx, cz };
+      const rug = mesh(new THREE.CircleGeometry(1, 40), new THREE.MeshStandardMaterial({ color: '#8fc3e8', roughness: 1, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }), cx, 0.012, cz);
+      rug.rotation.x = -Math.PI / 2; rug.scale.set(rx + 0.6, rz + 0.6, 1); rug.castShadow = false;
+      g.add(rug);
+      for (const off of [-0.11, 0.11]) {
+        const pts = [];
+        for (let i = 0; i < 64; i++) { const a = (i / 64) * Math.PI * 2; pts.push(new THREE.Vector3(cx + Math.cos(a) * (rx + off), 0.05, cz + Math.sin(a) * (rz + off))); }
+        g.add(mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts, true), 128, 0.018, 6, true), mat('#9aa3ad', { metalness: 0.7, roughness: 0.35 })));
+      }
+      for (let i = 0; i < 44; i++) {
+        const a = (i / 44) * Math.PI * 2;
+        const tie = mesh(new THREE.BoxGeometry(0.06, 0.03, 0.36), tWood, cx + Math.cos(a) * rx, 0.03, cz + Math.sin(a) * rz);
+        tie.rotation.y = Math.atan2(rz * Math.cos(a), rx * Math.sin(a));
+        g.add(tie);
+      }
+      // 기차 — 기관차 + 객차 둘
+      T.cars = [];
+      const eng = makeTrain(); eng.scale.setScalar(1.7); g.add(eng); T.cars.push(eng);
+      for (const c of ['#2f8a52', '#f4d35e']) {
+        const car = new THREE.Group();
+        car.add(mesh(new THREE.BoxGeometry(0.55, 0.26, 0.3), mat(c, { roughness: 0.4 }), 0, 0.22, 0));
+        car.add(mesh(new THREE.BoxGeometry(0.58, 0.04, 0.33), mat('#c0302c', { roughness: 0.4 }), 0, 0.37, 0));
+        for (const x of [-0.17, 0.17]) for (const z of [-0.16, 0.16]) { const wh = mesh(new THREE.CylinderGeometry(0.08, 0.08, 0.04, 12), mat('#2b2b33'), x, 0.08, z); wh.rotation.x = Math.PI / 2; car.add(wh); }
+        const gift = makeGift(0.2, 0.18, 0.2, c === '#2f8a52' ? '#d63a3a' : '#3a6fd6', '#ffffff'); gift.position.y = 0.39; car.add(gift);
+        g.add(car); T.cars.push(car);
+      }
+      T.trainA = 0.5; T.trainSp = 0; T.trainOn = false; T.chuff = 0;
+      // 블록 탑
+      T.tower = { x: -3.6, z: 2.0, blocks: [], fall: 0 };
+      T.circ(-3.6, 2.0, 0.45);
+      // 팽이
+      T.top = new THREE.Group();
+      T.top.position.set(3.6, 0, -2.0);
+      const tb = new THREE.Group();
+      tb.add(mesh(new THREE.ConeGeometry(0.22, 0.3, 18).rotateX(Math.PI), mat('#d63a3a', { roughness: 0.4 }), 0, 0.15, 0));
+      tb.add(mesh(new THREE.CylinderGeometry(0.24, 0.24, 0.06, 18), mat('#f4d35e', { roughness: 0.4 }), 0, 0.32, 0));
+      tb.add(mesh(new THREE.CylinderGeometry(0.03, 0.03, 0.18, 8), mat('#2f8a52'), 0, 0.42, 0));
+      for (let k = 0; k < 6; k++) tb.add(mesh(new THREE.BoxGeometry(0.05, 0.065, 0.05), mat(k % 2 ? '#ffffff' : '#3a6fd6'), Math.cos(k) * 0.21, 0.32, Math.sin(k) * 0.21));
+      T.top.add(tb); T.topBody = tb;
+      g.add(T.top);
+      T.spin = 0; T.topFall = 0;
+      // 흔들목마
+      const horse = new THREE.Group();
+      horse.position.set(-3.9, 0, -0.9);
+      horse.rotation.y = Math.PI / 2;
+      const hm = mat('#f2e3c6', { roughness: 0.8 });
+      for (const s of [-0.18, 0.18]) {
+        const pts = []; for (let i = 0; i <= 12; i++) { const a = -0.8 + (i / 12) * 1.6; pts.push(new THREE.Vector3(Math.sin(a) * 0.8, 0.8 - Math.cos(a) * 0.8 + 0.02, s)); }
+        horse.add(mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), 20, 0.035, 6), tWood));
+      }
+      const hb = mesh(new THREE.CapsuleGeometry(0.17, 0.5, 6, 10), hm, 0, 0.62, 0); hb.rotation.z = Math.PI / 2; horse.add(hb);
+      for (const x of [-0.25, 0.25]) for (const z of [-0.1, 0.1]) horse.add(mesh(new THREE.CylinderGeometry(0.04, 0.04, 0.45, 6), hm, x, 0.32, z));
+      const hn = mesh(new THREE.CapsuleGeometry(0.1, 0.25, 6, 10), hm, 0.38, 0.85, 0); hn.rotation.z = -0.6; horse.add(hn);
+      horse.add(mesh(new THREE.BoxGeometry(0.28, 0.14, 0.14), hm, 0.55, 1.0, 0));
+      horse.add(mesh(new THREE.BoxGeometry(0.25, 0.05, 0.3), mat('#d63a3a'), 0, 0.8, 0));
+      horse.add(mesh(new THREE.BoxGeometry(0.06, 0.3, 0.05), mat('#8b5a3c'), 0.3, 0.98, 0));
+      g.add(horse); T.horse = horse;
+      T.circ(-3.9, -0.9, 0.55);
+      // 장난감 상자
+      g.add(mesh(new THREE.BoxGeometry(1.0, 0.6, 0.6), mat('#3a6fd6', { roughness: 0.6 }), 4.4, 0.3, 3.4));
+      const lid = mesh(new THREE.BoxGeometry(1.04, 0.06, 0.64), mat('#f4d35e'), 4.4, 0.75, 3.15); lid.rotation.x = -0.9; g.add(lid);
+      g.add(mesh(new THREE.SphereGeometry(0.16, 12, 10), mat('#ff8fb1'), 4.2, 0.66, 3.4));
+      T.box(4.4, 3.4, 0.5, 0.3);
+      T.towerSpot = roomV(-2.85, 2.0); T.topSpot = roomV(2.95, -1.55);
+      for (let k = 0; k < 2; k++) toyBlock(T);
+    },
+    actions(T) {
+      return [
+        [T.trainOn ? '🛑 기차 세우기' : '🚂 기차 출발시키기', () => toyTrain(T)],
+        ['🌀 팽이 돌리기', () => toySpin(T)],
+        [`🧱 블록 쌓기 (${T.tower.blocks.length}층)`, () => toyStack(T)],
+        ...(T.tower.blocks.length >= 3 && !(T.tower.fall > 0) ? [['💥 블록 무너뜨리기', () => toyKnock(T)]] : []),
+      ];
+    },
+    update(T, dt, t) {
+      // 기차
+      T.trainSp = lerp(T.trainSp, T.trainOn ? 0.6 : 0, Math.min(1, dt * 1.2));
+      T.trainA += T.trainSp * dt;
+      const { rx, rz, cx, cz } = T.track;
+      T.cars.forEach((c, i) => {
+        const a = T.trainA - i * 0.3;
+        const tx = -rx * Math.sin(a), tz = rz * Math.cos(a);
+        c.position.set(cx + Math.cos(a) * rx, 0.05, cz + Math.sin(a) * rz);
+        c.rotation.y = Math.atan2(-tz, tx);
+      });
+      if (T.trainSp > 0.05) {
+        T.chuff -= dt;
+        if (T.chuff < 0) {
+          T.chuff = 0.22 / T.trainSp;
+          noiseHit({ freq: 700, q: 0.8, vol: 0.02 * T.trainSp, dur: 0.12 });
+          T.g.updateMatrixWorld(true);
+          puff(T.cars[0].localToWorld(new THREE.Vector3(0.12, 0.45, 0)), { n: 1, size: 0.18, up: 0.5, spread: 0.1, life: 1.0, opacity: 0.6 });
+        }
+      }
+      // 팽이
+      if (T.spin > 0) {
+        T.spin -= dt;
+        const k = T.spin / 6;
+        T.topBody.rotation.y += dt * (8 + k * 30);
+        T.top.rotation.z = Math.sin(t * 5) * 0.25 * (1 - k);
+        T.top.rotation.x = Math.cos(t * 5) * 0.25 * (1 - k);
+        if (T.spin <= 0) { T.topFall = 1; noiseHit({ freq: 1200, q: 1, vol: 0.05, dur: 0.1 }); }
+      } else if (T.topFall > 0) {
+        T.topFall -= dt * 0.5;
+        T.top.rotation.z = lerp(T.top.rotation.z, 1.25, Math.min(1, dt * 8));
+        if (T.topFall <= 0) { T.top.rotation.set(0, 0, 0); }
+      }
+      // 흔들목마 — 혼자 살랑살랑
+      T.horse.rotation.z = Math.sin(t * 1.2) * 0.08;
+      // 무너진 블록
+      if (T.tower.fall > 0) {
+        T.tower.fall -= dt;
+        for (const b of T.tower.blocks) {
+          if (!b.userData.v) continue;
+          b.userData.v.y -= 9.8 * dt;
+          b.position.addScaledVector(b.userData.v, dt);
+          b.rotation.x += b.userData.w * dt;
+          if (b.position.y < 0.16) { b.position.y = 0.16; b.userData.v.multiplyScalar(0.3); b.userData.w *= 0.5; }
+        }
+        if (T.tower.fall <= 0) {
+          for (const b of T.tower.blocks) T.g.remove(b);
+          T.tower.blocks = [];
+          for (let k = 0; k < 2; k++) toyBlock(T);
+          T.g.updateMatrixWorld(true);
+          puff(T.g.localToWorld(new THREE.Vector3(-3.6, 0.5, 2.0)), { n: 10, size: 0.5, spread: 1.2, life: 1, opacity: 0.6 });
+          refreshPanel(true);
+        }
+      }
+    },
+  });
+  function toyBlock(T) {
+    const n = T.tower.blocks.length;
+    const b = mesh(new THREE.BoxGeometry(0.34, 0.3, 0.34), mat(BLOCK_COLS[n % BLOCK_COLS.length], { roughness: 0.5 }), T.tower.x + (rnd() - 0.5) * 0.05, 0.15 + n * 0.3, T.tower.z + (rnd() - 0.5) * 0.05);
+    b.rotation.y = (rnd() - 0.5) * 0.4;
+    T.g.add(b);
+    T.tower.blocks.push(b);
+    return b;
+  }
+  function toyTrain(T) {
+    T.trainOn = !T.trainOn;
+    if (T.trainOn) {
+      faceTo(player, roomV(T.track.cx, T.track.cz));
+      faceCam(2.4, 7.5, 0.55);
+      tone(523, 0.06, 0.4); tone(659, 0.06, 0.4); tone(523, 0.05, 0.5, 0.35); tone(659, 0.05, 0.5, 0.35);
+      toast('🚂 칙칙폭폭~ 기차가 출발해요!');
+    } else toast('🛑 기차가 멈췄어요');
+    refreshPanel(true);
+  }
+  function toySpin(T) {
+    walkThen(T.topSpot, () => {
+      faceTo(player, roomV(3.6, -2.0));
+      faceCam(1.3, 4.2, 0.4);
+      player.userData.pose = 'crouch';
+      setTimeout(() => {
+        player.userData.pose = 'stand';
+        T.spin = 6; T.topFall = 0; T.top.rotation.set(0, 0, 0);
+        whoosh(); toast('🌀 뱅글뱅글~');
+      }, 500);
+    });
+  }
+  function toyTopple(T, msg) {
+    if (T.tower.fall > 0) return;
+    T.tower.fall = 2.5;
+    T.tower.blocks.forEach((bb, i) => { const a = rnd() * Math.PI * 2, s = 0.5 + i * 0.25; bb.userData.v = new THREE.Vector3(Math.cos(a) * s, 0.8, Math.sin(a) * s); bb.userData.w = (rnd() - 0.5) * 8; });
+    noiseHit({ freq: 600, q: 0.6, vol: 0.12, dur: 0.4 });
+    for (let i = 0; i < 6; i++) noiseHit({ freq: 1200 + Math.random() * 800, q: 1.5, vol: 0.05, dur: 0.05, when: 0.15 + i * 0.09 });
+    toast(msg);
+    refreshPanel(true);
+  }
+  function toyKnock(T) {
+    if (T.tower.fall > 0) return;
+    walkThen(T.towerSpot, () => {
+      faceTo(player, roomV(T.tower.x, T.tower.z));
+      faceCam(1.4, 5.2, 0.3);
+      player.userData.gesture = { type: 'throw', t: 0, dur: 0.9 };
+      setTimeout(() => toyTopple(T, '💥 와르르르~! 시원하게 무너뜨렸어요'), 450);
+    });
+  }
+  function toyStack(T) {
+    if (T.tower.fall > 0) return;
+    walkThen(T.towerSpot, () => {
+      faceTo(player, roomV(T.tower.x, T.tower.z));
+      faceCam(1.3, 5, 0.3);
+      player.userData.gesture = { type: 'reach', t: 0, dur: 0.9 };
+      setTimeout(() => {
+        const b = toyBlock(T);
+        tone(784 + T.tower.blocks.length * 40, 0.05, 0.3);
+        noiseHit({ freq: 1500, q: 1.5, vol: 0.05, dur: 0.05 });
+        if (T.tower.blocks.length >= 12) setTimeout(() => toyTopple(T, '🧱 와르르~ 너무 높이 쌓았나 봐요!'), 600);
+        else toast(`🧱 ${T.tower.blocks.length}층!`);
+        void b;
+        refreshPanel(true);
+      }, 450);
+    });
+  }
+
+  // ---------- 산타에게 편지 쓰는 방
+  const LETTER_KEY = 'santa.letters';
+  const letters = (() => { try { return JSON.parse(localStorage.getItem(LETTER_KEY) || '[]'); } catch { return []; } })();
+  defTheme('letter', {
+    name: '편지 · 멍멍이 방', emoji: '🐶',
+    door: '멍멍! 강아지가 반겨 주는 집이에요. 편지도 쓸 수 있어요.',
+    desc: '강아지에게 간식을 주고 쓰다듬어 줘요. 책상에서는 산타 할아버지께 편지도!',
+    build(g, T) {
+      // 책상 — 방 가운데, 벽난로를 바라보며 쓰는 큰 원목 책상 + 따뜻한 러그 · 스탠드 · 촛불
+      const rugD = mesh(new THREE.CircleGeometry(2.0, 40), new THREE.MeshStandardMaterial({ color: '#a8322e', roughness: 1, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }), -0.6, 0.012, 0.9);
+      rugD.rotation.x = -Math.PI / 2; rugD.scale.y = 0.8; rugD.castShadow = false; g.add(rugD);
+      const rugE = mesh(new THREE.RingGeometry(1.7, 1.85, 40), new THREE.MeshStandardMaterial({ color: '#f4d35e', roughness: 1, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -3 }), -0.6, 0.013, 0.9);
+      rugE.rotation.x = -Math.PI / 2; rugE.scale.y = 0.8; rugE.castShadow = false; g.add(rugE);
+      const dk = new THREE.MeshStandardMaterial({ map: woodTex, color: '#e0a979', roughness: 0.6 });
+      g.add(mesh(new THREE.BoxGeometry(2.2, 0.09, 1.1), dk, -0.6, 0.8, 0.5));
+      for (const sx of [-1.0, 1.0]) { g.add(mesh(new THREE.BoxGeometry(0.12, 0.76, 1.0), dk, -0.6 + sx, 0.38, 0.5)); }
+      g.add(mesh(new THREE.BoxGeometry(1.9, 0.5, 0.05), dk, -0.6, 0.5, 0.05));
+      for (const sx of [-0.75, 0.75]) g.add(mesh(new THREE.SphereGeometry(0.03, 8, 6), mat('#e8b23a', { metalness: 0.7, roughness: 0.3 }), -0.6 + sx, 0.7, 1.06));
+      T.paper = mesh(new THREE.BoxGeometry(0.42, 0.005, 0.32), mat('#fffaf0'), -0.6, 0.85, 0.75);
+      g.add(T.paper);
+      for (let k = 0; k < 4; k++) g.add(mesh(new THREE.BoxGeometry(0.32, 0.005, 0.004), mat('#c9a37a'), -0.6, 0.856, 0.66 + k * 0.06));
+      g.add(mesh(new THREE.CylinderGeometry(0.05, 0.06, 0.08, 12), mat('#2a2335', { roughness: 0.2 }), -0.2, 0.89, 0.55));
+      const quill = mesh(new THREE.ConeGeometry(0.035, 0.38, 6), mat('#ffffff'), -0.18, 1.04, 0.55); quill.rotation.z = -0.35; g.add(quill);
+      // 봉투 더미 · 쿠키 접시 · 작은 포인세티아
+      for (let k = 0; k < 4; k++) { const ev = mesh(new THREE.BoxGeometry(0.26, 0.012, 0.18), mat(k % 2 ? '#fffaf0' : '#fde6e6'), 0.15, 0.855 + k * 0.013, 0.3); ev.rotation.y = k * 0.2; g.add(ev); }
+      g.add(mesh(new THREE.CylinderGeometry(0.15, 0.12, 0.02, 16), whiteM, -1.35, 0.855, 0.75));
+      for (let k = 0; k < 3; k++) g.add(mesh(cookieGeos[k], cookieBaked, -1.4 + (k % 2) * 0.08, 0.87 + k * 0.012, 0.72 + k * 0.04));
+      g.add(mesh(new THREE.CylinderGeometry(0.09, 0.07, 0.14, 12), mat('#c8a06a'), -1.45, 0.92, 0.25));
+      for (let k = 0; k < 6; k++) { const a2 = (k / 6) * Math.PI * 2; const lf = mesh(new THREE.SphereGeometry(0.08, 8, 6), mat('#d63a3a', { roughness: 0.8 }), -1.45 + Math.cos(a2) * 0.08, 1.04, 0.25 + Math.sin(a2) * 0.08); lf.scale.set(1, 0.3, 0.55); lf.rotation.y = -a2; g.add(lf); }
+      // 스탠드 · 촛불 — 따뜻한 불빛
+      g.add(mesh(new THREE.CylinderGeometry(0.1, 0.12, 0.04, 14), mat('#2f8a52'), 0.3, 0.86, 0.85));
+      g.add(mesh(new THREE.CylinderGeometry(0.015, 0.015, 0.45, 6), mat('#2f8a52'), 0.3, 1.08, 0.85));
+      g.add(mesh(new THREE.ConeGeometry(0.18, 0.2, 14, 1, true), new THREE.MeshStandardMaterial({ color: '#2f8a52', emissive: '#ffd27a', emissiveIntensity: 0.45, side: THREE.DoubleSide }), 0.25, 1.33, 0.8));
+      const dl = new THREE.PointLight('#ffcf8a', 3.2, 3.5, 1.4); dl.position.set(0.0, 1.2, 0.85); g.add(dl);
+      g.add(mesh(new THREE.CylinderGeometry(0.045, 0.045, 0.2, 10), mat('#fff8ec'), -1.15, 0.94, 0.3));
+      const cfl = new THREE.Sprite(new THREE.SpriteMaterial({ map: softTex, color: '#ffbe55', transparent: true, blending: THREE.AdditiveBlending, depthWrite: false }));
+      cfl.scale.set(0.16, 0.26, 1); cfl.position.set(-1.15, 1.12, 0.3); g.add(cfl);
+      T.box(-0.6, 0.5, 1.1, 0.55);
+      // 의자 — 책상 앞(문 쪽)에서 벽난로를 바라봄
+      const chg = new THREE.Group(); chg.position.set(-0.6, 0, 1.35); g.add(chg);
+      chg.add(mesh(new THREE.BoxGeometry(0.52, 0.07, 0.5), mat('#d63a3a', { roughness: 0.8 }), 0, 0.5, 0));
+      chg.add(mesh(new THREE.BoxGeometry(0.52, 0.6, 0.06), dk, 0, 0.82, 0.25));
+      for (const sx of [-0.22, 0.22]) for (const sz of [-0.2, 0.2]) chg.add(mesh(new THREE.BoxGeometry(0.04, 0.48, 0.04), dk, sx, 0.24, sz));
+      T.chairPos = roomV(-0.6, 1.3); T.chairStand = roomV(0.5, 1.75);
+      // 우체통
+      T.mailPos = roomV(3.6, 2.7); T.mailFront = roomV(3.6, 1.75);
+      const mb = new THREE.Group(); mb.position.set(3.6, 0, 2.7); g.add(mb);
+      mb.add(mesh(new THREE.CylinderGeometry(0.33, 0.33, 1.05, 20), mat('#d63a3a', { roughness: 0.4 }), 0, 0.55, 0));
+      mb.add(mesh(new THREE.SphereGeometry(0.33, 20, 10, 0, Math.PI * 2, 0, Math.PI / 2), mat('#d63a3a', { roughness: 0.4 }), 0, 1.07, 0));
+      mb.add(mesh(new THREE.BoxGeometry(0.3, 0.05, 0.04), mat('#1d1210'), 0, 0.92, -0.32));
+      mb.add(mesh(new THREE.BoxGeometry(0.36, 0.1, 0.06), mat('#f4d35e'), 0, 0.7, -0.32));
+      T.flag = new THREE.Group(); T.flag.position.set(0.34, 0.9, 0); mb.add(T.flag);
+      T.flag.add(mesh(new THREE.BoxGeometry(0.03, 0.4, 0.03), mat('#2b2b33'), 0, 0.2, 0));
+      T.flag.add(mesh(new THREE.BoxGeometry(0.03, 0.15, 0.2), mat('#f4d35e'), 0, 0.33, 0.1));
+      T.flag.rotation.x = -1.4; T.flagUp = 0;
+      T.circ(3.6, 2.7, 0.4);
+      // 코르크 판 — 부친 편지가 핀으로
+      T.cork = [mesh(new THREE.BoxGeometry(0.05, 1.0, 1.5), mat('#c8a06a', { roughness: 1 }), 5.43, 2.0, 2.4), mesh(new THREE.BoxGeometry(0.06, 1.08, 1.58), tWood, 5.45, 2.0, 2.4)];
+      for (const c of T.cork) g.add(c);
+      T.pins = new THREE.Group(); g.add(T.pins); T.cork.push(T.pins);   // 벽에 붙은 것 — 벽이 숨으면 같이 숨김
+      const sign = makeSign('✉️ 산타 할아버지께', 2.0, 0.42, '#fff6e6', '#b82a2a');
+      sign.position.set(3.3, 2.75, -4.47); g.add(sign);
+      T.lastWrite = 0; T.readI = -1;
+      for (let i = 0; i < Math.min(letters.length, 12); i++) letterPin(T, i);
+      buildDog(g, T);
+    },
+    actions(T) {
+      const a = [['🦴 간식 주기', () => dogFeed(T)], ['🤚 쓰다듬기', () => dogPat(T)], ['✏️ 산타에게 편지 쓰기', () => writeLetter(T)]];
+      if (letters.length) {
+        a.push([`📖 보낸 편지 읽기 (${letters.length})`, () => readLetter(T)]);
+        if (T.readI >= 0 && T.readI < letters.length) a.push(['🗑 읽은 편지 지우기', () => deleteLetter(T)]);
+      }
+      return a;
+    },
+    update(T, dt, t) {
+      updateDog(T, dt, t);
+      for (const c of T.cork) c.visible = WALLS.right.visible;
+      T.flagUp = Math.max(0, T.flagUp - dt * 0.25);
+      T.flag.rotation.x = lerp(T.flag.rotation.x, T.flagUp > 0 ? 0 : -1.4, Math.min(1, dt * 4));
+      if (sitting === 'desk') { T.lastWrite -= dt; if (T.lastWrite < 0) { T.lastWrite = 0.18 + Math.random() * 0.2; noiseHit({ freq: 4500, q: 2, vol: 0.012, dur: 0.06 }); } }
+    },
+  });
+  // 보낸 편지 — 누를 때마다 한 통씩 (최근 것부터) 읽고, 읽은 편지는 지울 수 있음
+  function readLetter(T) {
+    if (!letters.length) return;
+    T.readI = T.readI > 0 && T.readI <= letters.length ? T.readI - 1 : letters.length - 1;
+    toast(`💌 ${letters.length - T.readI}번째 최근 편지: "${letters[T.readI]}"`, 4500);
+    tone(1046, 0.04, 0.6);
+    refreshPanel(true);
+  }
+  function deleteLetter(T) {
+    if (!(T.readI >= 0 && T.readI < letters.length)) return;
+    letters.splice(T.readI, 1);
+    localStorage.setItem(LETTER_KEY, JSON.stringify(letters));
+    while (T.pins.children.length) T.pins.remove(T.pins.children[0]);
+    for (let i = 0; i < Math.min(letters.length, 12); i++) letterPin(T, i);
+    T.readI = -1;
+    noiseHit({ freq: 3000, q: 0.6, vol: 0.05, dur: 0.25 });
+    toast(letters.length ? `🗑 편지를 지웠어요 (남은 편지 ${letters.length}통)` : '🗑 편지를 모두 지웠어요');
+    refreshPanel(true);
+  }
+  function letterPin(T, i) {
+    const p = mesh(new THREE.BoxGeometry(0.01, 0.22, 0.3), mat('#fffaf0'), 5.39, 2.3 - Math.floor(i / 4) * 0.3, 1.9 + (i % 4) * 0.34);
+    p.rotation.x = (rnd() - 0.5) * 0.2;
+    T.pins.add(p);
+    T.pins.add(mesh(new THREE.SphereGeometry(0.025, 6, 5), mat(BULB_COLORS[i % 6]), 5.37, 2.39 - Math.floor(i / 4) * 0.3, 1.9 + (i % 4) * 0.34));
+  }
+  function writeLetter(T) {
+    if (sitting) standUp();
+    walkThen(T.chairStand, () => {
+      sitThemed('desk', T.chairPos, Math.PI, 0.09, T.chairStand, () => { player.userData.armsMode = null; });
+      faceCam(0.95, 4.2, 0.45);
+      setTimeout(() => letterAsk(T), 500);   // 의자에 앉은 뒤에 편지지(입력창)
+    });
+  }
+  async function letterAsk(T) {
+      const tEl = $('#modal-title'), inEl = $('#modal-input'), oldT = tEl.textContent, oldP = inEl.placeholder;
+      tEl.textContent = '산타 할아버지께 쓰는 편지 (40자)';
+      inEl.placeholder = '예) 올해는 동생이랑 덜 싸웠어요!';
+      const text = await askText();
+      tEl.textContent = oldT; inEl.placeholder = oldP;
+      if (sitting !== 'desk') return;
+      if (!text) { standUp(); return; }
+      player.userData.armsMode = 'write';
+      toast('✏️ 꾹꾹 눌러 쓰는 중…');
+      setTimeout(() => {
+        if (sitting !== 'desk') return;
+        standUp();
+        const env = new THREE.Group();
+        env.add(mesh(new THREE.BoxGeometry(0.24, 0.16, 0.012), mat('#fffaf0')));
+        env.add(mesh(new THREE.SphereGeometry(0.025, 8, 6), mat('#d63a3a'), 0, 0, 0.01));
+        env.position.set(0, -0.3, 0.08);
+        const u = player.userData;
+        u.arms[1].elbow.add(env);
+        setTimeout(() => { if (env.parent) env.parent.remove(env); }, 15000);
+        walkThen(T.mailFront, () => {
+          faceTo(player, T.mailPos);
+          lookFrom(2.05, 0.35, 4.6);   // 방 안쪽 오른편에서 — 책상 · 의자에 가리지 않게
+          u.gesture = { type: 'reach', t: 0, dur: 1.0 };
+          setTimeout(() => {
+            if (env.parent) env.parent.remove(env);
+            letters.push(text.slice(0, 40));
+            localStorage.setItem(LETTER_KEY, JSON.stringify(letters.slice(-30)));
+            if (letters.length <= 12) letterPin(T, letters.length - 1);
+            T.flagUp = 6;
+            sparkle();
+            toast('📮 편지를 부쳤어요! 산타 할아버지가 꼭 읽어 주실 거예요 🎅', 3500);
+            refreshPanel(true);
+          }, 500);
+        });
+      }, 3400);
+  }
+
+  // ---------- 멍멍이 (편지 방) — 쉼터의 강아지 모양을 가져와 키움
+  //   상태: wander(어슬렁) · bowl(밥그릇으로) · eat · come(나에게 와서 쓰다듬기) · fetch(공 쫓기) · back(공 물고 돌아오기)
+  function makeDog(color) {
+    const g = new THREE.Group();
+    const m = new THREE.MeshStandardMaterial({ color, roughness: 0.92, envMapIntensity: 0.12 });
+    const light = new THREE.MeshStandardMaterial({ color: '#fbf3e4', roughness: 0.95 });
+    const dark = new THREE.MeshStandardMaterial({ color: '#2a2335', roughness: 0.55 });
+    const body = mesh(new THREE.CapsuleGeometry(0.16, 0.24, 4, 10), m, 0, 0.3, 0);
+    body.rotation.x = Math.PI / 2;
+    g.add(body);
+    const head = new THREE.Group();
+    head.position.set(0, 0.42, 0.27);
+    g.add(head);
+    head.add(mesh(new THREE.SphereGeometry(0.15, 14, 12), m));
+    const snout = mesh(new THREE.SphereGeometry(0.075, 10, 8), light, 0, -0.035, 0.115);
+    snout.scale.set(1, 0.8, 1.25);
+    head.add(snout);
+    head.add(mesh(new THREE.SphereGeometry(0.027, 8, 6), dark, 0, -0.015, 0.205));
+    for (const s2 of [-1, 1]) {
+      head.add(mesh(new THREE.SphereGeometry(0.023, 8, 6), dark, s2 * 0.056, 0.035, 0.128));
+      const ear = mesh(new THREE.SphereGeometry(0.058, 8, 8), new THREE.MeshStandardMaterial({ color: '#8a5a3c', roughness: 0.95 }), s2 * 0.12, 0.04, 0);
+      ear.scale.set(0.45, 1.3, 0.85);
+      head.add(ear);
+    }
+    const collar = mesh(new THREE.TorusGeometry(0.11, 0.022, 6, 16), mat('#d63a3a'), 0, -0.1, -0.03);
+    collar.rotation.x = Math.PI / 2 - 0.3;
+    head.add(collar);
+    head.add(mesh(new THREE.SphereGeometry(0.03, 8, 6), mat('#e8b23a', { metalness: 0.8, roughness: 0.25 }), 0, -0.16, 0.06));
+    const legs = [];
+    for (const [lx, lz] of [[-0.1, 0.14], [0.1, 0.14], [-0.1, -0.14], [0.1, -0.14]]) {
+      const l = new THREE.Group();
+      l.position.set(lx, 0.22, lz);
+      l.add(mesh(new THREE.CapsuleGeometry(0.046, 0.13, 3, 6), m, 0, -0.085, 0));
+      g.add(l);
+      legs.push(l);
+    }
+    const tail = new THREE.Group();
+    tail.position.set(0, 0.36, -0.26);
+    tail.rotation.x = -0.6;
+    tail.add(mesh(new THREE.CapsuleGeometry(0.034, 0.15, 3, 6), m, 0, 0.1, 0));
+    g.add(tail);
+    g.scale.setScalar(1.35);
+    g.userData = { legs, tail, head, t: rnd() * 5, wag: 1 };
+    return g;
+  }
+  function buildDog(g, T) {
+    // 강아지 방석 · 밥그릇 · 공
+    g.add(mesh(new THREE.CylinderGeometry(0.62, 0.66, 0.16, 24), mat('#8fb8de', { roughness: 1 }), 2.7, 0.08, -2.5));
+    g.add(mesh(new THREE.TorusGeometry(0.56, 0.12, 8, 24), mat('#3a5a8a', { roughness: 1 }), 2.7, 0.18, -2.5).rotateX(Math.PI / 2));
+    T.bowlPos = new THREE.Vector3(4.2, 0, -1.1);
+    g.add(mesh(new THREE.CylinderGeometry(0.2, 0.15, 0.1, 16, 1, true), mat('#d63a3a', { roughness: 0.5, side: THREE.DoubleSide }), 4.2, 0.05, -1.1));
+    g.add(mesh(new THREE.CircleGeometry(0.15, 16).rotateX(-Math.PI / 2), mat('#d63a3a'), 4.2, 0.012, -1.1));
+    T.kibble = new THREE.Group(); T.kibble.position.set(4.2, 0.06, -1.1); g.add(T.kibble);
+    for (let k = 0; k < 10; k++) T.kibble.add(mesh(new THREE.SphereGeometry(0.035, 6, 5), mat('#a0663a'), (rnd() - 0.5) * 0.18, rnd() * 0.03, (rnd() - 0.5) * 0.18));
+    T.kibble.visible = false;
+    T.circ(4.2, -1.1, 0.22);
+    T.ball = mesh(new THREE.SphereGeometry(0.09, 12, 10), mat('#c7e04a', { roughness: 0.7 }), 3.4, 0.09, -2.0);
+    g.add(T.ball);
+    T.dog = makeDog('#d9a066');
+    T.dog.position.set(2.7, 0.16, -2.5);
+    g.add(T.dog);
+    T.dogMode = 'wander'; T.dogTarget = null; T.dogWait = 2; T.dogTimer = 0; T.ballV = null; T.barkT = 6;
+  }
+  const dogRoom = (v) => new THREE.Vector3(v.x - INT.x, 0, v.z - INT.z);
+  function dogGo(T, p, mode) { T.dogTarget = p.clone(); T.dogMode = mode; }
+  function bark(n = 2) { for (let i = 0; i < n; i++) { tone(620, 0.06, 0.12, i * 0.2, master, 'square'); tone(480, 0.05, 0.1, i * 0.2 + 0.05, master, 'square'); } }
+  function updateDog(T, dt, t) {
+    const d = T.dog, u = d.userData;
+    u.t += dt;
+    let moving = false;
+    const speed = T.dogMode === 'fetch' || T.dogMode === 'back' || T.dogMode === 'come' || T.dogMode === 'path' ? 3.0 : T.dogMode === 'bowl' ? 2.2 : 1.1;
+    if (T.dogMode === 'wander' && !T.dogTarget) {
+      T.dogWait -= dt;
+      if (T.dogWait < 0) { T.dogTarget = new THREE.Vector3((rnd() - 0.5) * 8, 0, (rnd() - 0.5) * 6); T.dogWait = 2 + rnd() * 4; }
+    }
+    if (T.dogMode === 'come') T.dogTarget = dogRoom(player.position).add(new THREE.Vector3(Math.sin(player.rotation.y) * 1.2, 0, Math.cos(player.rotation.y) * 1.2));   // 쪼그려 앉은 무릎 앞 — 몸이 겹치지 않게
+    if (T.dogTarget) {
+      const dx = T.dogTarget.x - d.position.x, dz = T.dogTarget.z - d.position.z, dd = Math.hypot(dx, dz);
+      if (dd > 0.12) {
+        const st = Math.min(dd, speed * dt);
+        const w = new THREE.Vector3(INT.x + d.position.x + dx / dd * st, 0, INT.z + d.position.z + dz / dd * st);
+        pushOut(w);
+        d.position.x = w.x - INT.x; d.position.z = w.z - INT.z;
+        let r = Math.atan2(dx, dz) - d.rotation.y; r = Math.atan2(Math.sin(r), Math.cos(r));
+        d.rotation.y += r * Math.min(1, dt * 8);
+        moving = true;
+        T.dogTimer += dt;
+        if (T.dogTimer > 6) { T.dogTarget = null; T.dogTimer = 0; if (T.dogMode === 'path' && T.onArrive) { T.dogMode = 'arrived'; T.onArrive(); } else T.dogMode = 'wander'; }
+      } else {
+        T.dogTimer = 0;
+        T.dogTarget = null;
+        if (T.dogMode === 'bowl') { T.dogMode = 'eat'; T.eatT = 3.2; d.rotation.y = Math.atan2(T.bowlPos.x - d.position.x, T.bowlPos.z - d.position.z); }
+        else if (T.dogMode === 'fetch') { T.dogMode = 'back'; T.ballV = null; T.ball.position.set(0, -0.06, 0.2); u.head.add(T.ball); T.ball.scale.setScalar(0.75); }
+        else if (T.dogMode === 'back') {
+          T.dogMode = 'wander';
+          u.head.remove(T.ball); T.g.add(T.ball); T.ball.scale.setScalar(1);
+          T.ball.position.set(d.position.x + Math.sin(d.rotation.y) * 0.45, 0.09, d.position.z + Math.cos(d.rotation.y) * 0.45);
+          u.wag = 3; bark(2); floatText(d.localToWorld(new THREE.Vector3(0, 0.75, 0.2)), '♥', '#ff4d8d');
+          toast('🐶 공을 물어 왔어요! 또 던져 달래요');
+          refreshPanel(true);
+        } else if (T.dogMode === 'come') { /* 곁에서 기다림 */ }
+        else if (T.dogMode === 'path') { if (T.dogPath.length) T.dogTarget = T.dogPath.shift(); else { T.dogMode = 'arrived'; if (T.onArrive) T.onArrive(); } }
+        else T.dogMode = 'wander';
+      }
+    }
+    // 밥 먹기 — 고개를 숙이고 냠냠
+    if (T.dogMode === 'eat') {
+      T.eatT -= dt;
+      u.head.rotation.x = 0.55 + Math.sin(u.t * 14) * 0.08;
+      if (Math.random() < dt * 4) noiseHit({ freq: 1800, q: 1.5, vol: 0.03, dur: 0.04 });
+      if (T.eatT < 0) { T.kibble.visible = false; T.dogMode = 'wander'; u.wag = 3; floatText(d.localToWorld(new THREE.Vector3(0, 0.75, 0.2)), '♥', '#ff4d8d'); toast('🐶 냠냠 다 먹었어요! 꼬리를 살랑살랑'); }
+    } else u.head.rotation.x = lerp(u.head.rotation.x, T.patT > 0 ? -0.3 : 0, Math.min(1, dt * 6));
+    // 날아가는 공
+    if (T.ballV) {
+      T.ballV.y -= 9.8 * dt;
+      T.ball.position.addScaledVector(T.ballV, dt);
+      if (T.ball.position.y < 0.09) { T.ball.position.y = 0.09; T.ballV.y = Math.abs(T.ballV.y) * 0.45; T.ballV.x *= 0.7; T.ballV.z *= 0.7; if (Math.abs(T.ballV.y) > 0.5) noiseHit({ freq: 900, q: 1, vol: 0.04, dur: 0.05 }); }
+      T.ball.position.x = clamp(T.ball.position.x, -5, 5); T.ball.position.z = clamp(T.ball.position.z, -3, 4);
+      if (T.dogMode === 'fetch') T.dogTarget = new THREE.Vector3(T.ball.position.x, 0, T.ball.position.z);
+      if (Math.hypot(T.ballV.x, T.ballV.z) < 0.2 && T.ball.position.y < 0.1) T.ballV = null;
+    }
+    if (T.patT > 0) { T.patT -= dt; }
+    u.wag = Math.max(1, u.wag - dt * 0.4);
+    const sw = moving ? Math.sin(u.t * 14) : 0;
+    u.legs.forEach((l, i) => { l.rotation.x = lerp(l.rotation.x, sw * (i % 2 ? 1 : -1) * 0.6, Math.min(1, dt * 14)); });
+    u.tail.rotation.z = Math.sin(u.t * (moving ? 10 : 6) * u.wag * 0.8) * 0.55;
+    d.position.y = Math.abs(sw) * 0.04;
+    if (!moving && T.dogMode === 'wander') u.head.rotation.y = Math.sin(u.t * 0.8) * 0.4;
+    T.barkT -= dt;
+    if (T.barkT < 0) { T.barkT = 12 + rnd() * 15; if (T.dogMode === 'wander') bark(1); }
+  }
+  function dogFeed(T) {
+    walkThen(roomV(3.5, -1.1), () => {
+      faceTo(player, roomV(4.2, -1.1));
+      faceCam(1.3, 4.6, 0.35);
+      player.userData.pose = 'crouch';
+      setTimeout(() => {
+        player.userData.pose = 'stand';
+        T.kibble.visible = true;
+        noiseHit({ freq: 3000, q: 0.7, vol: 0.06, dur: 0.3 });
+        bark(2);
+        dogGo(T, new THREE.Vector3(4.2, 0, -0.6), 'bowl');
+        toast('🦴 간식을 담았어요! 강아지가 달려와요');
+      }, 600);
+    });
+  }
+  // 쓰다듬기 — 내 곁의 탁 트인 자리를 골라, 강아지가 가구를 피해(실내 길찾기) 그리로 걸어와서 마주 보고 쓰다듬음
+  function petSpot(P) {
+    for (let k = 0; k < 16; k++) {
+      const a = player.rotation.y + (k % 2 ? 1 : -1) * Math.ceil(k / 2) * (Math.PI / 8);
+      const D = new THREE.Vector3(P.x + Math.sin(a) * 1.15, 0, P.z + Math.cos(a) * 1.15);
+      if (roomFree(D.x, D.z) && lineFree(P, D)) return D;
+    }
+    return null;
+  }
+  function dogPat(T) {
+    const d = T.dog;
+    let P = player.position.clone().setY(0);
+    let D = roomFree(P.x, P.z) ? petSpot(P) : null;
+    const go = () => {
+      bark(1);
+      toast('🐶 이리 와~ 강아지가 다가와요');
+      const from = roomV(d.position.x, d.position.z);
+      T.dogPath = (roomPath(from, D) || [D]).map((v) => dogRoom(v));
+      T.dogMode = 'path'; T.dogTarget = T.dogPath.shift(); T.dogTimer = 0;
+      T.onArrive = () => {
+        const dp = roomV(d.position.x, d.position.z);
+        d.rotation.y = Math.atan2(player.position.x - dp.x, player.position.z - dp.z);
+        faceTo(player, dp);
+        faceCam(1.4, 4.2, 0.35);
+        player.userData.pose = 'crouch';
+        player.userData.gesture = { type: 'press', t: 0, dur: 2.2 };
+        T.patT = 2.6; d.userData.wag = 3.5; T.dogMode = 'pat';
+        d.updateMatrixWorld(true);
+        for (let i = 0; i < 3; i++) setTimeout(() => floatText(d.localToWorld(new THREE.Vector3(0, 0.8, 0.2)), '♥', '#ff4d8d'), i * 600);
+        toast('🐶 쓰담쓰담~ 꼬리가 살랑살랑');
+        setTimeout(() => { player.userData.pose = 'stand'; if (T.dogMode === 'pat') T.dogMode = 'wander'; }, 2400);
+      };
+    };
+    if (D) { go(); return; }
+    // 내 자리가 가구 사이라면 — 탁 트인 곳으로 먼저 걸어감
+    const open = [roomV(2.0, 1.4), roomV(1.0, -1.6), roomV(-2.8, -1.0), roomV(2.6, 3.2)].sort((p, q) => p.distanceTo(player.position) - q.distanceTo(player.position));
+    walkThen(open[0], () => { P = player.position.clone().setY(0); D = petSpot(P); if (D) go(); });
+  }
+
+
+  function dogThrow(T) {
+    if (T.dogMode === 'fetch' || T.dogMode === 'back') return;
+    if (T.ball.parent !== T.g) { T.dog.userData.head.remove(T.ball); T.g.add(T.ball); T.ball.scale.setScalar(1); }
+    const u = player.userData;
+    // 방에서 넓은 쪽(가운데)으로 던짐
+    const p = dogRoom(player.position);
+    let dir = Math.atan2(-p.x, 0.5 - p.z) + (rnd() - 0.5) * 0.8;   // 방 가운데 쪽으로
+    const dist = 2.6 + rnd() * 0.9;
+    const tx = clamp(p.x + Math.sin(dir) * dist, -4.2, 4.2), tz = clamp(p.z + Math.cos(dir) * dist, -2.8, 3.6);
+    faceTo(player, roomV(tx, tz));
+    faceCam(2.75, 9, 0.85);   // 높이서 방 전체 — 날아가는 공 · 쫓아갔다 돌아오는 강아지가 다 보이게
+    u.gesture = { type: 'throw', t: 0, dur: 0.9 };
+    setTimeout(() => {
+      u.arms[1].elbow.getWorldPosition(tmpV);
+      T.ball.position.copy(toRoom(tmpV));
+      const fl = 0.9;
+      T.ballV = new THREE.Vector3((tx - T.ball.position.x) / fl, 4.2, (tz - T.ball.position.z) / fl);
+      whoosh(); bark(2);
+      dogGo(T, new THREE.Vector3(tx, 0, tz), 'fetch');
+      toast('🎾 던졌다! 강아지가 쫓아가요');
+    }, 420);
+    setTimeout(() => { if (T.dogMode === 'back') { T.dogTarget = dogRoom(player.position).add(new THREE.Vector3(Math.sin(player.rotation.y) * 1.2, 0, Math.cos(player.rotation.y) * 1.2)); } }, 2600);
+  }
+  // ---------- 트리 꾸미기 방
+  const DECO_COLS = ['#d42a2a', '#f2b632', '#3a6fd6', '#ff8fb1', '#e9eef6', '#2fd67a'];
+  defTheme('deco', {
+    name: '트리 꾸미기 방', emoji: '🎄',
+    door: '아직 아무것도 안 달린 트리가 기다려요. 함께 꾸며 볼까요?',
+    desc: '빈 트리에 오너먼트를 하나씩 달고, 전구를 감고, 꼭대기에 별을 올려요.',
+    build(g, T) {
+      const tx = -1.9, tz = -0.9;
+      T.c = { x: tx, z: tz };
+      T.tiers = [];
+      g.add(mesh(new THREE.CylinderGeometry(0.5, 0.42, 0.45, 18), mat('#c0302c', { roughness: 0.5 }), tx, 0.22, tz));
+      g.add(mesh(new THREE.CylinderGeometry(0.14, 0.18, 0.5, 10), mat('#6b4a32'), tx, 0.6, tz));
+      const nm = new THREE.MeshStandardMaterial({ color: '#2b7547', roughness: 0.8, flatShading: true });
+      for (let i = 0; i < 4; i++) {
+        const r = 1.5 - i * 0.33, h = 1.25 - i * 0.1, y = 0.6 + i * 0.68;
+        T.tiers.push({ r, h, y });
+        g.add(mesh(new THREE.ConeGeometry(r, h, 14), nm, tx, y + h / 2, tz));
+      }
+      T.topY = T.tiers[3].y + T.tiers[3].h;
+      T.circ(tx, tz, 1.55);
+      // 오너먼트 상자
+      g.add(mesh(new THREE.BoxGeometry(0.75, 0.32, 0.55), tWood, 0.7, 0.16, 0.6));
+      for (let k = 0; k < 9; k++) g.add(mesh(new THREE.SphereGeometry(0.09, 10, 8), new THREE.MeshStandardMaterial({ color: DECO_COLS[k % 6], roughness: 0.2, metalness: 0.5 }), 0.47 + (k % 3) * 0.23, 0.35, 0.45 + Math.floor(k / 3) * 0.15));
+      T.circ(0.7, 0.6, 0.45);
+      // 전구 (감기 전엔 숨김)
+      T.bulbs = []; T.rings = [];
+      T.tiers.forEach((t, i) => {
+        const fm = i < 3 ? (T.tiers[i + 1].y - t.y - 0.12) / t.h : 0.7;
+        for (const f of [0.1, fm * 0.75]) {
+          const ring = []; T.rings.push(ring);
+          const r = t.r * (1 - f) + 0.05, n = Math.max(6, Math.round(r * 2 * Math.PI / 0.3));
+          for (let k = 0; k < n; k++) {
+            const a = (k / n) * Math.PI * 2 + i;
+            const b = new THREE.Mesh(new THREE.SphereGeometry(0.05, 8, 6), new THREE.MeshBasicMaterial({ color: BULB_COLORS[k % 6], toneMapped: false }));
+            b.position.set(tx + Math.cos(a) * r, t.y + t.h * f, tz + Math.sin(a) * r);
+            const gl = new THREE.Sprite(new THREE.SpriteMaterial({ map: softTex, color: BULB_COLORS[k % 6], transparent: true, opacity: 0.5, depthWrite: false, blending: THREE.AdditiveBlending }));
+            gl.scale.setScalar(0.35); b.add(gl);
+            b.userData = { base: new THREE.Color(BULB_COLORS[k % 6]), ph: rnd() * 6.28, gl };
+            b.visible = false;
+            g.add(b); T.bulbs.push(b); ring.push(b);
+          }
+        }
+      });
+      T.rings.sort((a, b) => a[0].position.y - b[0].position.y);   // 아래 줄부터
+      // 별
+      const sh = new THREE.Shape();
+      for (let i = 0; i < 10; i++) { const a = Math.PI / 2 + (i / 10) * Math.PI * 2, r = i % 2 ? 0.12 : 0.28; if (i) sh.lineTo(Math.cos(a) * r, Math.sin(a) * r); else sh.moveTo(Math.cos(a) * r, Math.sin(a) * r); }
+      const sg = new THREE.ExtrudeGeometry(sh, { depth: 0.06, bevelEnabled: true, bevelThickness: 0.02, bevelSize: 0.02, bevelSegments: 1 }); sg.center();
+      T.star = mesh(sg, new THREE.MeshStandardMaterial({ color: '#ffd54a', emissive: '#ffb300', emissiveIntensity: 0.9, metalness: 0.4, roughness: 0.3 }), tx, T.topY + 0.2, tz);
+      T.star.visible = false; g.add(T.star);
+      T.starGlow = new THREE.Sprite(new THREE.SpriteMaterial({ map: softTex, color: '#fff1a8', transparent: true, opacity: 0.6, depthWrite: false, blending: THREE.AdditiveBlending }));
+      T.starGlow.scale.setScalar(1.6); T.starGlow.position.copy(T.star.position); T.starGlow.visible = false; g.add(T.starGlow);
+      T.orns = []; T.lit = 0; T.lighting = -1; T.done = false; T.ringN = 0;
+      // ---- 바닥 장식 — 따뜻한 크리스마스 방 (러그 · 선물 · 포인세티아 · 바닥 랜턴 · 장난감 썰매 · 솔방울 · 종이 고리)
+      const rugT = canvasTex(256, (c, S) => {
+        c.fillStyle = '#b8322f'; c.fillRect(0, 0, S, S);
+        c.strokeStyle = '#f6efe4'; c.lineWidth = 10; c.beginPath(); c.arc(S / 2, S / 2, S * 0.42, 0, Math.PI * 2); c.stroke();
+        c.strokeStyle = '#2f8a52'; c.lineWidth = 14; c.beginPath(); c.arc(S / 2, S / 2, S * 0.33, 0, Math.PI * 2); c.stroke();
+        c.fillStyle = '#f6efe4';
+        for (let k = 0; k < 12; k++) { const a = (k / 12) * Math.PI * 2; c.beginPath(); c.arc(S / 2 + Math.cos(a) * S * 0.38, S / 2 + Math.sin(a) * S * 0.38, 7, 0, Math.PI * 2); c.fill(); }
+      });
+      rugT.wrapS = rugT.wrapT = THREE.ClampToEdgeWrapping;
+      const rug = mesh(new THREE.CircleGeometry(2.6, 48), new THREE.MeshStandardMaterial({ map: rugT, roughness: 1, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }), tx + 0.3, 0.012, tz + 0.4);
+      rug.rotation.x = -Math.PI / 2; rug.castShadow = false; g.add(rug);
+      [[-0.9, 1.1, '#d63a3a', '#f4d35e'], [0.2, 1.35, '#2f8a52', '#ffffff'], [1.0, 0.6, '#3a6fd6', '#f4d35e'], [-1.4, 0.2, '#f4d35e', '#d63a3a'], [0.9, -0.5, '#ff8fb1', '#ffffff']].forEach(([dx, dz, c1, c2], k) => {
+        const gg = makeGift(0.42 + (k % 2) * 0.12, 0.34 + (k % 3) * 0.08, 0.42, c1, c2); gg.position.set(tx + dx, 0.02, tz + dz); gg.rotation.y = k * 0.7; g.add(gg);
+      });
+      for (const [x, z] of [[3.8, -3.2], [-4.6, 1.8]]) {
+        g.add(mesh(new THREE.CylinderGeometry(0.22, 0.17, 0.32, 14), mat('#c8a06a', { roughness: 0.9 }), x, 0.16, z));
+        for (let k = 0; k < 7; k++) { const a = (k / 7) * Math.PI * 2; const lf = mesh(new THREE.SphereGeometry(0.16, 8, 6), mat(k % 2 ? '#c0302c' : '#d63a3a', { roughness: 0.8 }), x + Math.cos(a) * 0.17, 0.45, z + Math.sin(a) * 0.17); lf.scale.set(1, 0.3, 0.55); lf.rotation.y = -a; g.add(lf); }
+        g.add(mesh(new THREE.SphereGeometry(0.06, 8, 6), mat('#f4d35e'), x, 0.5, z));
+        T.circ(x, z, 0.3);
+      }
+      T.lanterns = [];
+      for (const [x, z] of [[1.6, -2.4], [2.4, 2.6], [-4.4, -0.1]]) {
+        const lg = new THREE.Group(); lg.position.set(x, 0, z); g.add(lg);
+        lg.add(mesh(new THREE.BoxGeometry(0.32, 0.04, 0.32), mat('#2b2b33', { metalness: 0.5, roughness: 0.4 }), 0, 0.02, 0));
+        for (const sx of [-0.14, 0.14]) for (const sz of [-0.14, 0.14]) lg.add(mesh(new THREE.BoxGeometry(0.03, 0.42, 0.03), mat('#2b2b33', { metalness: 0.5 }), sx, 0.23, sz));
+        lg.add(mesh(new THREE.ConeGeometry(0.24, 0.16, 4).rotateY(Math.PI / 4), mat('#2b2b33', { metalness: 0.5 }), 0, 0.52, 0));
+        lg.add(mesh(new THREE.CylinderGeometry(0.06, 0.06, 0.16, 10), mat('#fff8ec'), 0, 0.12, 0));
+        const fl = new THREE.Sprite(new THREE.SpriteMaterial({ map: softTex, color: '#ffbe55', transparent: true, blending: THREE.AdditiveBlending, depthWrite: false }));
+        fl.scale.set(0.3, 0.42, 1); fl.position.y = 0.28; lg.add(fl);
+        const pl = new THREE.PointLight('#ffb35a', 1.2, 2.5, 1.5); pl.position.y = 0.3; lg.add(pl);
+        T.lanterns.push({ fl, pl, ph: rnd() * 6 });
+        T.circ(x, z, 0.25);
+      }
+      const sl = new THREE.Group(); sl.position.set(2.9, 0, 0.9); sl.rotation.y = -0.5; g.add(sl);
+      sl.add(mesh(new THREE.BoxGeometry(1.0, 0.25, 0.5), mat('#c62828', { roughness: 0.4 }), 0, 0.3, 0));
+      for (const sz of [-0.22, 0.22]) sl.add(mesh(new THREE.BoxGeometry(1.1, 0.04, 0.05), mat('#e8b23a', { metalness: 0.8, roughness: 0.3 }), 0, 0.12, sz));
+      for (const sz of [-0.22, 0.22]) for (const sx of [-0.35, 0.35]) sl.add(mesh(new THREE.BoxGeometry(0.04, 0.16, 0.04), mat('#e8b23a', { metalness: 0.8 }), sx, 0.2, sz));
+      sl.add(mesh(new THREE.BoxGeometry(0.7, 0.08, 0.52), new THREE.MeshStandardMaterial({ map: stripeTex('#2f8a52', '#f6efe4', 6, false), roughness: 1 }), -0.1, 0.47, 0));
+      const pg = makeGift(0.3, 0.26, 0.3, '#f4d35e', '#d63a3a'); pg.position.set(0.25, 0.43, 0); sl.add(pg);
+      T.circ(2.9, 0.9, 0.55);
+      g.add(mesh(new THREE.CylinderGeometry(0.3, 0.24, 0.26, 14, 1, true), mat('#c8a06a', { roughness: 1, side: THREE.DoubleSide }), -0.2, 0.13, 2.9));
+      for (let k = 0; k < 6; k++) { const pc = mesh(new THREE.ConeGeometry(0.07, 0.16, 8), mat('#7a5236', { roughness: 1, flatShading: true }), -0.2 + Math.cos(k) * 0.14, 0.28, 2.9 + Math.sin(k) * 0.14); pc.rotation.set(rnd(), rnd(), rnd()); g.add(pc); }
+      T.circ(-0.2, 2.9, 0.32);
+      for (let k = 0; k < 14; k++) { const rg = mesh(new THREE.TorusGeometry(0.08, 0.02, 6, 12), mat(k % 2 ? '#d63a3a' : '#2f8a52', { roughness: 0.9 }), 2.2 + k * 0.22, 3.3 - Math.sin((k / 13) * Math.PI) * 0.45, -4.45); rg.rotation.y = k % 2 ? Math.PI / 2 : 0; g.add(rg); }
+    },
+    actions(T) {
+      if (T.done) return [['🔄 처음부터 다시 꾸미기', () => decoReset(T)]];
+      const a = [];
+      if (T.orns.length < 12) a.push([`🔴 오너먼트 달기 (${T.orns.length}/12)`, () => decoOrn(T)]);
+      if (!T.lit) a.push([`✨ 전구 한 줄 감기 (${T.ringN}/${T.rings.length})`, () => decoLights(T)]);
+      if (T.orns.length >= 4 && T.lit) a.push(['⭐ 꼭대기에 별 달기', () => decoStar(T)]);
+      return a;
+    },
+    update(T, dt, t) {
+      if (T.lighting >= 0) {   // 지금 감는 한 줄 — 한 알씩 차례로
+        const ring = T.rings[T.ringN];
+        T.lighting += dt / 1.4;
+        const n = Math.floor(T.lighting * ring.length);
+        for (let i = 0; i < Math.min(n, ring.length); i++) if (!ring[i].visible) { ring[i].visible = true; tone(1200 + i * 30, 0.012, 0.15); }
+        if (T.lighting >= 1) {
+          T.lighting = -1; T.ringN++;
+          if (T.ringN >= T.rings.length) { T.lit = 1; toast('✨ 전구를 다 감았어요! 반짝반짝'); sparkle(); }
+          else toast(`✨ 전구 ${T.ringN}/${T.rings.length}줄`);
+          refreshPanel(true);
+        }
+      }
+      for (const L of T.lanterns) { const f = 0.85 + Math.sin(t * 9 + L.ph) * 0.1 + Math.sin(t * 23 + L.ph) * 0.05; L.fl.material.opacity = f; L.pl.intensity = 1.2 * f; }
+      for (const b of T.bulbs) {
+        if (!b.visible) continue;
+        const tw = 0.5 + 0.5 * Math.sin(t * 2.2 + b.userData.ph);
+        b.material.color.copy(b.userData.base).multiplyScalar(0.45 + tw * 0.75);
+        b.userData.gl.material.opacity = 0.15 + tw * tw * 0.6;
+      }
+      if (T.star.visible) { T.star.rotation.y = t * 0.8; T.star.scale.setScalar(Math.min(1, T.star.scale.x + dt * 2)); T.starGlow.material.opacity = 0.5 + Math.sin(t * 2.4) * 0.15; }
+    },
+    enter(T) { INTS.cornerTree.visible = false; INTS.cornerBlock.off = true; },
+  });
+  function decoSpot(T) {
+    const lx = player.position.x - INT.x, lz = player.position.z - INT.z;
+    const mid = Math.atan2(0 - T.c.z, 0 - T.c.x);   // 트리에서 방 가운데 쪽
+    let base = Math.atan2(lz - T.c.z, lx - T.c.x);
+    let dlt = Math.atan2(Math.sin(base - mid), Math.cos(base - mid));
+    base = mid + clamp(dlt, -0.8, 0.8);
+    const spot = roomV(T.c.x + Math.cos(base) * 2.15, T.c.z + Math.sin(base) * 2.15);
+    pushOut(spot);
+    return { base, spot };
+  }
+  function decoOrn(T) {
+    if (sitting) standUp();
+    const { base, spot } = decoSpot(T);
+    walkThen(spot, () => {
+      const u = player.userData;
+      faceTo(player, roomV(T.c.x, T.c.z));
+      faceCam(2.5, 5.2, 0.3);
+      const col = DECO_COLS[T.orns.length % DECO_COLS.length];
+      const held = mesh(new THREE.SphereGeometry(0.13, 14, 10), new THREE.MeshStandardMaterial({ color: col, roughness: 0.2, metalness: 0.5 }));
+      held.position.set(0, -0.36, 0.05);
+      u.arms[1].elbow.add(held);
+      u.gesture = { type: 'hang', t: 0, dur: 1.8 };
+      setTimeout(() => {
+        held.getWorldPosition(tmpV);
+        const from = toRoom(tmpV);
+        u.arms[1].elbow.remove(held);
+        const i = Math.floor(rnd() * 3), t = T.tiers[i], fm = (T.tiers[i + 1].y - t.y - 0.15) / t.h;
+        const f = 0.12 + rnd() * Math.max(0.05, fm - 0.2), a = base + (rnd() - 0.5) * 1.5, r = t.r * (1 - f) + 0.1;
+        const o = new THREE.Group();
+        o.add(mesh(new THREE.SphereGeometry(0.13, 14, 10), held.material));
+        o.add(mesh(new THREE.CylinderGeometry(0.035, 0.035, 0.05, 8), mat('#e8b23a', { metalness: 0.8, roughness: 0.3 }), 0, 0.14, 0));
+        o.position.copy(from);
+        T.g.add(o);
+        o.userData.hang = { t: 0, from, to: new THREE.Vector3(T.c.x + Math.cos(a) * r, t.y + t.h * f, T.c.z + Math.sin(a) * r) };
+        hangingOrns.push(o);
+        T.orns.push(o);
+        tone(1046 + T.orns.length * 60, 0.05, 0.6);
+        refreshPanel(true);
+      }, 950);
+    });
+  }
+  function decoLights(T) {
+    if (sitting) standUp();
+    const { spot } = decoSpot(T);
+    if (T.lighting >= 0 || T.lit) return;
+    walkThen(spot, () => {
+      faceTo(player, roomV(T.c.x, T.c.z));
+      faceCam(2.5, 5.2, 0.3);
+      player.userData.gesture = { type: 'hang', t: 0, dur: 1.5 };
+      T.lighting = 0;
+      refreshPanel(true);
+    });
+  }
+  function decoStar(T) {
+    if (sitting) standUp();
+    const { spot } = decoSpot(T);
+    walkThen(spot, () => {
+      faceTo(player, roomV(T.c.x, T.c.z));
+      faceCam(2.6, 6.5, 0.25);
+      jump();
+      player.userData.gesture = { type: 'hang', t: 0, dur: 1.4 };
+      setTimeout(() => {
+        T.star.visible = true; T.star.scale.setScalar(0.01); T.starGlow.visible = true; T.done = true;
+        T.g.updateMatrixWorld(true);
+        confetti(T.g.localToWorld(T.star.position.clone()), 120, 4);
+        sparkle(); pop();
+        toast('⭐ 트리 완성! 정말 예쁘게 꾸몄어요', 3200);
+        setTimeout(() => { player.userData.gesture = { type: 'joy', t: 0, dur: 1.8 }; hopSounds(); }, 500);
+        refreshPanel(true);
+      }, 600);
+    });
+  }
+  function decoReset(T) {
+    for (const o of T.orns) T.g.remove(o);
+    T.orns = []; T.lit = 0; T.lighting = -1; T.done = false; T.ringN = 0;
+    for (const b of T.bulbs) b.visible = false;
+    T.star.visible = false; T.starGlow.visible = false;
+    T.g.updateMatrixWorld(true);
+    puff(T.g.localToWorld(new THREE.Vector3(T.c.x, 1.5, T.c.z)), { n: 14, size: 0.6, spread: 1.5, opacity: 0.6 });
+    refreshPanel(true);
+  }
+
+  // ---------- 음악실
+  defTheme('music', {
+    name: '음악실', emoji: '🎹',
+    door: '안에서 딩동댕 피아노 소리가 들려요. 음악실이에요!',
+    desc: '피아노 의자에 앉아 캐럴을 치고, 핸드벨도 흔들어 봐요.',
+    build(g, T) {
+      // 업라이트 피아노 (오른쪽 벽, 창문 피해서 앞쪽)
+      const pk = mat('#2a1f1c', { roughness: 0.25, metalness: 0.1 });
+      g.add(mesh(new THREE.BoxGeometry(0.6, 1.3, 1.7), pk, 5.15, 0.65, 2.0));
+      g.add(mesh(new THREE.BoxGeometry(0.42, 0.12, 1.7), pk, 4.7, 0.72, 2.0));
+      g.add(mesh(new THREE.BoxGeometry(0.2, 0.03, 1.6), mat('#fbf8f0', { roughness: 0.3 }), 4.6, 0.79, 2.0));
+      for (let k = 0; k < 11; k++) if (k % 7 !== 2 && k % 7 !== 6) g.add(mesh(new THREE.BoxGeometry(0.11, 0.04, 0.05), mat('#111'), 4.65, 0.81, 1.3 + k * 0.13 + 0.06));
+      for (let k = 0; k < 12; k++) g.add(mesh(new THREE.BoxGeometry(0.2, 0.005, 0.005), mat('#999'), 4.6, 0.81, 1.27 + k * 0.13));
+      g.add(mesh(new THREE.BoxGeometry(0.03, 0.32, 0.42), mat('#fffaf0'), 4.86, 1.48, 2.0).rotateZ(-0.2));
+      for (const z of [1.25, 2.75]) {
+        g.add(mesh(new THREE.CylinderGeometry(0.04, 0.04, 0.2, 10), mat('#fff8ec'), 5.0, 1.42, z));
+        const cf = new THREE.Sprite(new THREE.SpriteMaterial({ map: softTex, color: '#ffc04a', transparent: true, blending: THREE.AdditiveBlending, depthWrite: false }));
+        cf.scale.set(0.14, 0.22, 1); cf.position.set(5.0, 1.6, z); g.add(cf);
+      }
+      T.box(5.0, 2.0, 0.45, 0.88);
+      // 피아노 의자
+      g.add(mesh(new THREE.BoxGeometry(0.4, 0.08, 0.9), mat('#7a1717', { roughness: 0.9 }), 3.95, 0.5, 2.0));
+      for (const sz of [-0.38, 0.38]) g.add(mesh(new THREE.BoxGeometry(0.34, 0.46, 0.05), pk, 3.95, 0.23, 2.0 + sz));
+      T.benchPos = roomV(3.95, 2.0); T.benchStand = roomV(3.3, 2.85);
+      // 핸드벨 탁자
+      g.add(mesh(new THREE.BoxGeometry(1.5, 0.06, 0.7), mat('#2f8a52', { roughness: 1 }), -3.3, 0.78, 1.6));
+      for (const sx of [-0.65, 0.65]) for (const sz of [-0.28, 0.28]) g.add(mesh(new THREE.BoxGeometry(0.06, 0.76, 0.06), tWood, -3.3 + sx, 0.38, 1.6 + sz));
+      const bc = ['#d63a3a', '#f4d35e', '#2f8a52', '#3a6fd6', '#9b59b6'];
+      for (let k = 0; k < 5; k++) {
+        const hb = new THREE.Group();
+        hb.position.set(-3.85 + k * 0.27, 0.81, 1.55);
+        const s = 1 - k * 0.1;
+        hb.add(mesh(new THREE.CylinderGeometry(0.05 * s, 0.12 * s, 0.16 * s, 14, 1, true), mat('#e8b23a', { metalness: 0.85, roughness: 0.2, side: THREE.DoubleSide }), 0, 0.08 * s, 0));
+        hb.add(mesh(new THREE.CylinderGeometry(0.02, 0.02, 0.22 * s, 8), mat(bc[k]), 0, 0.27 * s, 0));
+        g.add(hb);
+      }
+      T.box(-3.3, 1.6, 0.75, 0.35);
+      T.bellSpot = roomV(-3.3, 2.65);
+      // 보면대 · 북
+      g.add(mesh(new THREE.CylinderGeometry(0.02, 0.02, 1.2, 6), mat('#2b2b33'), 1.8, 0.6, 3.0));
+      const sheet = mesh(new THREE.BoxGeometry(0.5, 0.36, 0.02), mat('#fffaf0'), 1.8, 1.25, 3.0); sheet.rotation.x = -0.3; g.add(sheet);
+      g.add(mesh(new THREE.CylinderGeometry(0.4, 0.4, 0.45, 20), mat('#d63a3a', { roughness: 0.5 }), -3.9, 0.23, -0.9));
+      g.add(mesh(new THREE.CylinderGeometry(0.41, 0.41, 0.03, 20), mat('#fbf8f0'), -3.9, 0.47, -0.9));
+      T.circ(-3.9, -0.9, 0.45);
+      const sign = makeSign('🎵 음악실', 1.4, 0.42, '#fff6e6', '#7a3bd6');
+      sign.position.set(3.3, 2.75, -4.47); g.add(sign);
+      T.noteT = 0;
+    },
+    actions(T) { return [['🎹 피아노로 캐럴 치기', () => playPiano(T)], ['🔔 핸드벨 울리기', () => ringHandbells(T)]]; },
+    sitActions() { return []; },
+    update(T, dt) {
+      if (sitting === 'piano') {
+        T.noteT -= dt;
+        if (T.noteT < 0) { T.noteT = 0.45; T.g.updateMatrixWorld(true); floatText(T.g.localToWorld(new THREE.Vector3(4.7, 1.3, 1.5 + Math.random())), pick(['♪', '♫', '♩'])); }
+      }
+    },
+  });
+  function playPiano(T) {
+    ensureAudio();
+    if (!actx) return;
+    walkThen(T.benchStand, () => {
+      sitThemed('piano', T.benchPos, Math.PI / 2, 0.08, T.benchStand, () => stopPiano(T));
+      player.userData.armsMode = 'piano';
+      faceCam(1.2, 4.4, 0.3);
+      bgmDuck(true);
+      const s = BGM[Math.floor(Math.random() * BGM.length)];
+      T.bus = actx.createGain(); T.bus.gain.value = 1; T.bus.connect(master);
+      const beat = 60 / (s.bpm * 1.25);
+      let tt = 0.15;
+      for (const [m, b] of s.melody.slice(0, 30)) {
+        const f = midi(m + s.oct);
+        tone(f, 0.12, 1.5, tt, T.bus, 'triangle');
+        tone(f * 2, 0.025, 0.5, tt, T.bus);
+        tt += b * beat;
+      }
+      toast(`🎹 ${s.name} 연주 중…`);
+      T.endTimer = setTimeout(() => { if (sitting === 'piano') { toast('👏 짝짝짝! 멋진 연주였어요'); standUp(); } }, (tt + 1.2) * 1000);
+    });
+  }
+  function stopPiano(T) {
+    clearTimeout(T.endTimer);
+    if (T.bus) { const b = T.bus; b.gain.setTargetAtTime(0, actx.currentTime, 0.1); setTimeout(() => b.disconnect(), 500); T.bus = null; }
+    player.userData.armsMode = null;
+    bgmDuck(false);
+  }
+  function ringHandbells() {
+    if (sitting) standUp();
+    const T = THEMES.music;
+    walkThen(T.bellSpot, () => {
+      faceTo(player, roomV(-3.3, 1.6));
+      faceCam(1.0, 4.8, 0.25);
+      const u = player.userData;
+      const hbs = [0, 1].map((k) => {
+        const hb = new THREE.Group();
+        hb.add(mesh(new THREE.CylinderGeometry(0.02, 0.02, 0.2, 8), mat(k ? '#d63a3a' : '#2f8a52'), 0, -0.12, 0));
+        hb.add(mesh(new THREE.CylinderGeometry(0.05, 0.12, 0.16, 14, 1, true), mat('#e8b23a', { metalness: 0.85, roughness: 0.2, side: THREE.DoubleSide }), 0, -0.3, 0));
+        hb.position.set(0, -0.2, 0.03);
+        u.arms[k].elbow.add(hb);
+        return hb;
+      });
+      u.armsMode = 'bells';
+      setTimeout(() => { for (const hb of hbs) if (hb.parent) hb.parent.remove(hb); if (u.armsMode === 'bells') u.armsMode = null; }, 2600);
+      [72, 76, 79, 84, 79, 76, 72].forEach((m, i) => {
+        const f = midi(m);
+        tone(f, 0.09, 2.2, i * 0.32); tone(f * 2.76, 0.03, 0.6, i * 0.32); tone(f * 5.4, 0.012, 0.25, i * 0.32);
+      });
+    });
+  }
+
+  // ---------- 포근한 침실
+  defTheme('bed', {
+    name: '포근한 침실', emoji: '🛏',
+    door: '포근한 이불이 깔린 침실이에요. 살금살금 들어가 볼까요?',
+    desc: '이불을 걷고 누워 포근하게 덮고, 벽난로에 커다란 크리스마스 양말을 걸어 봐요.',
+    build(g, T) {
+      const bx = -4.1, bz = -0.6;
+      g.add(mesh(new THREE.BoxGeometry(2.3, 0.35, 1.5), tWood, bx, 0.22, bz));
+      g.add(mesh(new THREE.BoxGeometry(2.15, 0.2, 1.4), mat('#ffffff', { roughness: 0.9 }), bx, 0.5, bz));
+      const quiltTex = canvasTex(128, (c, S) => {
+        const cols = ['#d63a3a', '#f6efe4', '#2f8a52', '#f4d35e', '#8fb8de', '#ff8fb1'];
+        for (let y = 0; y < 4; y++) for (let x = 0; x < 4; x++) { c.fillStyle = cols[(x + y * 2) % cols.length]; c.fillRect(x * 32, y * 32, 32, 32); c.strokeStyle = '#ffffff'; c.lineWidth = 2; c.setLineDash([4, 3]); c.strokeRect(x * 32 + 3, y * 32 + 3, 26, 26); }
+      });
+      // 이불 — 발끝(침대 끝)을 축으로 한 장. k = 덮은 길이(1 = 베개 앞까지), 걷으면 발치에 두툼하게 접힘
+      T.bpiv = new THREE.Group(); T.bpiv.position.set(bx + 1.12, 0.63, bz); g.add(T.bpiv);
+      T.quilt = mesh(new THREE.BoxGeometry(1.55, 0.08, 1.48).translate(-0.775, 0, 0), new THREE.MeshStandardMaterial({ map: quiltTex, roughness: 0.95 }));
+      T.bpiv.add(T.quilt);
+      T.bk = { k: 1, y: 0.63, tk: 1, ty: 0.63 };
+      const pillow = mesh(new THREE.BoxGeometry(0.45, 0.16, 0.9), mat('#fbf8f0', { roughness: 0.9 }), bx - 0.82, 0.68, bz);
+      pillow.scale.y = 1; g.add(pillow);
+      g.add(mesh(new THREE.BoxGeometry(0.12, 1.25, 1.6), tWood, bx - 1.15, 0.62, bz));
+      for (const sz of [-0.72, 0.72]) {
+        g.add(mesh(new THREE.CylinderGeometry(0.05, 0.05, 0.95, 10), tWood, bx + 1.15, 0.47, bz + sz));
+        g.add(mesh(new THREE.SphereGeometry(0.07, 10, 8), mat('#e8b23a', { metalness: 0.7, roughness: 0.3 }), bx + 1.15, 0.98, bz + sz));
+      }
+      T.box(bx, bz, 1.18, 0.78);
+      // 양말 (걸면 보임)
+      // 커다란 크리스마스 양말 — 벽난로 선반 왼쪽 끝에 (산타가 선물을 넣어 주는 자리)
+      T.sock = new THREE.Group(); T.sock.position.set(-1.45, 2.24, -3.32); g.add(T.sock);
+      const velvet = mat('#c62828', { roughness: 0.85 }), fur = mat('#fbfbf6', { roughness: 1 }), grn = mat('#2f8a52', { roughness: 0.85 });
+      T.sock.add(mesh(new THREE.BoxGeometry(0.52, 0.24, 0.14), fur, 0, -0.05, 0));                       // 하얀 털 단
+      T.sock.add(mesh(new THREE.BoxGeometry(0.42, 0.85, 0.12), velvet, 0, -0.6, 0));                     // 다리
+      T.sock.add(mesh(new THREE.BoxGeometry(0.68, 0.36, 0.12), velvet, 0.13, -1.12, 0));                 // 발
+      T.sock.add(mesh(new THREE.SphereGeometry(0.18, 12, 10).scale(1, 1, 0.33), velvet, 0.42, -1.12, 0)); // 둥근 발끝
+      T.sock.add(mesh(new THREE.BoxGeometry(0.2, 0.3, 0.13), grn, -0.18, -1.12, 0));                     // 뒤꿈치
+      T.sock.add(mesh(new THREE.SphereGeometry(0.17, 12, 10).scale(1, 1, 0.38), grn, 0.46, -1.12, 0.01));
+      for (let k = 0; k < 5; k++) T.sock.add(mesh(new THREE.BoxGeometry(0.42, 0.04, 0.125), k % 2 ? fur : grn, 0, -0.32 - k * 0.12, 0));   // 줄무늬
+      for (const x of [-0.14, 0.14]) T.sock.add(mesh(new THREE.SphereGeometry(0.05, 10, 8), mat('#e8b23a', { metalness: 0.85, roughness: 0.2 }), x, -0.17, 0.08));
+      T.sock.add(mesh(new THREE.TorusGeometry(0.05, 0.012, 6, 12), mat('#e8b23a', { metalness: 0.8 }), 0, 0.1, 0));   // 거는 고리
+      const sw = makeWreath(0.09); sw.position.set(0.12, -0.75, 0.08); T.sock.add(sw);
+      T.sockToy = makeBear(); T.sockToy.scale.setScalar(0.9); T.sockToy.position.set(0, -0.05, 0); T.sock.add(T.sockToy);   // 선물이 빼꼼
+      T.sock.visible = false; T.sockHung = false;
+      T.sockSpot = roomV(-1.45, -2.35);
+      // 협탁 · 스탠드
+      g.add(mesh(new THREE.BoxGeometry(0.55, 0.55, 0.5), tWood, -4.95, 0.28, 0.85));
+      g.add(mesh(new THREE.CylinderGeometry(0.06, 0.08, 0.3, 10), mat('#f4d35e'), -4.95, 0.7, 0.85));
+      T.shadeMat = new THREE.MeshStandardMaterial({ color: '#fff3d6', emissive: '#ffcf6a', emissiveIntensity: 0.6, side: THREE.DoubleSide });
+      g.add(mesh(new THREE.ConeGeometry(0.2, 0.22, 16, 1, true), T.shadeMat, -4.95, 0.95, 0.85));
+      T.lamp = new THREE.PointLight('#ffd9a0', 2.5, 3.5, 1.4); T.lamp.position.set(-4.8, 0.95, 0.85); g.add(T.lamp);
+      T.box(-4.95, 0.85, 0.3, 0.28);
+      // 옷장
+      g.add(mesh(new THREE.BoxGeometry(0.75, 2.2, 1.4), mat('#e9d3b5', { roughness: 0.8 }), 5.05, 1.1, -2.6));
+      for (const sz of [-0.04, 0.04]) g.add(mesh(new THREE.SphereGeometry(0.04, 8, 6), mat('#e8b23a', { metalness: 0.7, roughness: 0.3 }), 4.66, 1.1, -2.6 + sz));
+      g.add(mesh(new THREE.BoxGeometry(0.02, 2.1, 0.02), mat('#b8a07c'), 4.67, 1.1, -2.6));
+      T.box(5.05, -2.6, 0.4, 0.72);
+      // 동그란 러그
+      const rug = mesh(new THREE.CircleGeometry(1.3, 36), new THREE.MeshStandardMaterial({ color: '#f6d6de', roughness: 1, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }), -1.8, 0.012, 0.6);
+      rug.rotation.x = -Math.PI / 2; rug.castShadow = false; g.add(rug);
+      T.bedSide = roomV(-3.6, 0.75);
+      T.lampOn = true; T.zT = 0;
+    },
+    actions(T) {
+      return [
+        ['🛏 이불 덮고 눕기', () => lieBed(T)],
+        [T.sockHung ? '🎁 큰 양말 들여다보기' : '🧦 벽난로에 큰 양말 걸기', () => bedSock(T)],
+        [T.lampOn ? '💡 스탠드 끄기' : '💡 스탠드 켜기', () => bedLamp(T)],
+      ];
+    },
+    sitActions(T) { return [[T.lampOn ? '💡 스탠드 끄기' : '💡 스탠드 켜기', () => bedLamp(T)]]; },
+    update(T, dt) {
+      if (sitting === 'bed') {
+        T.zT -= dt;
+        if (T.zT < 0) { T.zT = 1.3; player.userData.head.getWorldPosition(tmpV); floatText(tmpV.clone().add(new THREE.Vector3(0.1, 0.35, 0)), 'Z z z', '#5a7bd6'); }
+      }
+      T.lamp.intensity = lerp(T.lamp.intensity, T.lampOn ? 2.5 : 0, Math.min(1, dt * 5));
+      T.bk.k = lerp(T.bk.k, T.bk.tk, Math.min(1, dt * 3.2)); T.bk.y = lerp(T.bk.y, T.bk.ty, Math.min(1, dt * 3.2));
+      T.bpiv.scale.set(T.bk.k, 1 + (1 - T.bk.k) * 1.8, 1);   // 접히면 두툼하게
+      T.bpiv.position.y = T.bk.y;
+      T.shadeMat.emissiveIntensity = T.lampOn ? 0.6 : 0.05;
+      INTS.lamp.intensity = lerp(INTS.lamp.intensity, T.lampOn ? 10 : 3.5, Math.min(1, dt * 3));
+    },
+    enter(T) { T.lampOn = true; },
+  });
+  function lieBed(T) {
+    walkThen(T.bedSide, () => {
+      // 1) 이불 끝을 잡고 발치로 걷음  2) 침대에 누움  3) 이불을 끌어 올려 가슴까지 덮음
+      faceTo(player, roomV(-4.1, -0.6));
+      lookFrom(0.95, 0.5, 4.8);
+      player.userData.gesture = { type: 'reach', t: 0, dur: 0.8 };
+      T.bk.tk = 0.22; T.bk.ty = 0.68;
+      noiseHit({ freq: 700, q: 0.5, vol: 0.05, dur: 0.35 });
+      setTimeout(() => {
+        sitThemed('bed', roomV(-3.15, -0.6), Math.PI / 2, 0.84, T.bedSide, () => { T.bk.tk = 1; T.bk.ty = 0.63; });
+        player.userData.pose = 'lie';
+      }, 750);
+      setTimeout(() => {
+        if (sitting !== 'bed') return;
+        T.bk.tk = 0.86; T.bk.ty = 1.0;
+        noiseHit({ freq: 600, q: 0.5, vol: 0.05, dur: 0.45 });
+        toast('🛏 포근하게 덮었어요. 창밖에 눈이 소복소복…');
+      }, 1700);
+    });
+  }
+
+  function bedSock(T) {
+    if (sitting) standUp();
+    walkThen(T.sockSpot, () => {
+      faceTo(player, roomV(-1.45, -4.5));
+      faceCam(2.35, 5.5, 0.3);   // 뒤 비스듬히 — 벽난로 선반의 큰 양말과 나
+      if (!T.sockHung) {
+        player.userData.gesture = { type: 'hang', t: 0, dur: 1.4 };
+        setTimeout(() => { T.sock.visible = true; T.sockHung = true; tone(1046, 0.05, 0.6); toast('🧦 양말을 걸었어요. 산타 할아버지가 뭘 넣어 주실까요?'); refreshPanel(true); }, 700);
+      } else {
+        player.userData.gesture = { type: 'reach', t: 0, dur: 0.9 };
+        setTimeout(() => {
+          T.sock.visible = false; T.sockHung = false;
+          T.g.updateMatrixWorld(true);
+          puff(T.g.localToWorld(T.sock.position.clone()), { n: 8, color: '#fff6c8', size: 0.3, spread: 0.5 });
+          receiveGift(pick(GIFT_ITEMS));
+          refreshPanel(true);
+        }, 450);
+      }
+    });
+  }
+  function bedLamp(T) { T.lampOn = !T.lampOn; noiseHit({ freq: 3000, q: 2, vol: 0.06, dur: 0.03 }); refreshPanel(true); }
+
+  // ---------- 선물 포장실 · 뜨개질
+  const PAPERS = [['빨강', '#d63a3a'], ['초록', '#2f8a52'], ['파랑', '#3a6fd6'], ['금색', '#e8b23a'], ['분홍', '#ff8fb1']];
+  const RIBBONS = [['금색', '#f4d35e'], ['하양', '#ffffff'], ['빨강', '#d63a3a'], ['초록', '#2f8a52']];
+  defTheme('wrap', {
+    name: '선물 포장 · 뜨개질 방', emoji: '🎀',
+    door: '포장지가 가득한 방이에요. 선물을 예쁘게 포장해 볼까요?',
+    desc: '포장지와 리본을 골라 선물을 포장하고, 흔들의자에서 목도리를 떠 봐요.',
+    build(g, T) {
+      // 포장 탁자 — 왼쪽 벽에 붙여서 (안쪽 +z 로컬이 방 가운데 쪽)
+      const tb = new THREE.Group(); tb.position.set(-4.75, 0, 1.5); tb.rotation.y = Math.PI / 2; g.add(tb); T.tbl = tb;
+      tb.add(mesh(new THREE.BoxGeometry(2.4, 0.08, 1.1), tWood, 0, 0.84, 0));
+      for (const sx of [-1.1, 1.1]) for (const sz of [-0.48, 0.48]) tb.add(mesh(new THREE.BoxGeometry(0.07, 0.82, 0.07), tWood, sx, 0.41, sz));
+      T.box(-4.75, 1.5, 0.55, 1.2);
+      T.roll = mesh(new THREE.CylinderGeometry(0.09, 0.09, 0.9, 14), mat(PAPERS[0][1], { roughness: 0.7 }), -0.75, 0.97, -0.2);
+      T.roll.rotation.x = Math.PI / 2; tb.add(T.roll);
+      T.sheet = mesh(new THREE.BoxGeometry(0.7, 0.005, 0.55), T.roll.material, -0.15, 0.885, 0.1); tb.add(T.sheet);
+      T.spool = mesh(new THREE.TorusGeometry(0.1, 0.05, 8, 16), mat(RIBBONS[0][1], { roughness: 0.4 }), 0.45, 0.95, -0.3);
+      T.spool.rotation.x = Math.PI / 2; tb.add(T.spool);
+      for (const sgn of [-1, 1]) { const sc = mesh(new THREE.BoxGeometry(0.22, 0.01, 0.03), mat('#c0c4cc', { metalness: 0.8, roughness: 0.3 }), 0.45, 0.89, 0.25); sc.rotation.y = sgn * 0.3; tb.add(sc); }
+      T.pi = 0; T.ri = 0; T.wrapped = []; T.wrapping = false;
+      // 포장지 꽂이 (오른쪽 벽 앞쪽)
+      g.add(mesh(new THREE.BoxGeometry(0.5, 0.45, 1.2), tWood, 5.0, 0.23, 2.3));
+      PAPERS.forEach(([, c], k) => { const r = mesh(new THREE.CylinderGeometry(0.08, 0.08, 1.3, 12), mat(c, { roughness: 0.7 }), 5.0 + (k % 2) * 0.12, 0.95, 1.85 + k * 0.22); r.rotation.z = -0.15; g.add(r); });
+      T.box(5.0, 2.3, 0.3, 0.6);
+      // 흔들의자 + 털실 바구니
+      const ch = new THREE.Group(); ch.position.set(0, 0, 0); ch.rotation.y = Math.PI / 2; ch.scale.setScalar(1.4); g.add(ch); T.chair = ch;   // 방 한가운데, 큼직하게 — 벽난로 불을 바라봄
+      ch.add(mesh(new THREE.BoxGeometry(0.4, 0.1, 0.6), mat('#2f8a52', { roughness: 0.9 }), -0.1, 0.5, 0));   // 좌석은 뒤쪽 — 무릎 아래가 앞으로 내려오게
+      ch.add(mesh(new THREE.BoxGeometry(0.1, 0.8, 0.6), tWood, -0.3, 0.9, 0));
+      for (const sz of [-0.3, 0.3]) {
+        ch.add(mesh(new THREE.BoxGeometry(0.55, 0.06, 0.06), tWood, 0, 0.7, sz));
+        const pts = []; for (let i = 0; i <= 10; i++) { const a = -0.7 + (i / 10) * 1.4; pts.push(new THREE.Vector3(Math.sin(a) * 0.6, 0.62 - Math.cos(a) * 0.6, sz)); }
+        ch.add(mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), 16, 0.03, 6), tWood));
+        for (const x of [-0.22, 0.22]) ch.add(mesh(new THREE.BoxGeometry(0.05, 0.45, 0.05), tWood, x, 0.27, sz));
+      }
+      T.circ(0, 0, 0.58);
+      g.add(mesh(new THREE.CylinderGeometry(0.28, 0.22, 0.3, 14, 1, true), mat('#c8a06a', { roughness: 1, side: THREE.DoubleSide }), -1.15, 0.15, 0.3));
+      for (const [x, z, c] of [[-1.05, 0.37, '#f6efe4'], [-1.17, 0.4, '#2f8a52']]) g.add(mesh(new THREE.SphereGeometry(0.12, 12, 10), mat(c, { roughness: 1 }), x, 0.28, z));
+      T.yarn = mesh(new THREE.SphereGeometry(0.13, 14, 10), new THREE.MeshStandardMaterial({ map: stripeTex('#d63a3a', '#b02a2a', 10, true), roughness: 1 }), -1.2, 0.29, 0.25);   // 뜨는 실타래 — 뜨는 동안 빙글빙글
+      g.add(T.yarn);
+      T.circ(-1.15, 0.3, 0.3);
+      // 바늘 두 개 (뜰 때 손에) · 실 한 가닥
+      {
+        const nm = mat('#c9ced6', { metalness: 0.8, roughness: 0.3 }), knob = mat('#f4d35e');
+        const kg = new THREE.Group(); T.kg = kg;
+        // 왼쪽 바늘 (왼손 → 오른쪽으로, 살짝 비스듬히) — 코가 걸려 있는 바늘
+        const ln = new THREE.Group(); ln.position.set(0, 0.03, 0); ln.rotation.z = 0.12; kg.add(ln);
+        const lnm = mesh(new THREE.CylinderGeometry(0.009, 0.009, 0.44, 8).rotateZ(Math.PI / 2), nm, 0, 0, 0); ln.add(lnm);
+        ln.add(mesh(new THREE.SphereGeometry(0.022, 8, 6), knob, -0.22, 0, 0));
+        // 코 — 바늘에 줄줄이 걸린 고리 (실과 같은 하양 · 빨강)
+        T.stitches = [];
+        for (let k = 0; k < 10; k++) {
+          const st = mesh(new THREE.TorusGeometry(0.02, 0.007, 6, 12).rotateY(Math.PI / 2), mat(k % 2 ? '#e04848' : '#ffffff', { roughness: 1 }), -0.1 + k * 0.022, -0.005, 0);
+          ln.add(st); T.stitches.push(st);
+        }
+        // 뜬 목도리 — 왼쪽 바늘 코 아래로 늘어짐 (뜰수록 길어짐)
+        T.fabric = mesh(new THREE.BoxGeometry(0.22, 1, 0.02).translate(0, -0.5, 0), new THREE.MeshStandardMaterial({ map: stripeTex('#d63a3a', '#ffffff', 8, false), roughness: 1 }), 0.0, -0.02, 0);
+        T.fabric.scale.y = 0.05; ln.add(T.fabric);
+        // 오른쪽 바늘 — 오른손 쪽을 축으로, 끝이 왼쪽 바늘 코에 들어갔다 나옴
+        const rp = new THREE.Group(); rp.position.set(0.2, 0.02, 0.03); kg.add(rp); T.rNeedle = rp;
+        const rnm = mesh(new THREE.CylinderGeometry(0.009, 0.009, 0.42, 8).rotateZ(Math.PI / 2), nm, -0.21, 0, 0); rp.add(rnm);
+        rp.add(mesh(new THREE.SphereGeometry(0.022, 8, 6), knob, 0.0, 0, 0));
+        T.wrap = mesh(new THREE.TorusGeometry(0.018, 0.007, 6, 12).rotateY(Math.PI / 2), mat('#ffffff', { roughness: 1 }), -0.36, 0, 0);   // 바늘 끝에 감긴 실
+        rp.add(T.wrap);
+        T.rTip = new THREE.Vector3(-0.36, 0, 0);
+        T.needles = [];
+      }
+      T.threadTex = stripeTex('#ffffff', '#e04848', 6, true); T.threadTex.repeat.set(14, 1);
+      T.thread = mesh(new THREE.BufferGeometry(), new THREE.MeshStandardMaterial({ map: T.threadTex, roughness: 1 }));   // 꼬인 털실 — 무늬가 손 쪽으로 흘러감   // 실타래 → 손까지 실 한 가닥 (매 프레임 다시 만듦)
+      T.thread.castShadow = false; T.thread.frustumCulled = false; T.thread.visible = false; g.add(T.thread);
+      T.threadPts = Array.from({ length: 12 }, () => new THREE.Vector3());
+      // 바닥 인형들 — 곰 · 진저 쿠키 · 눈사람 · 펭귄
+      const bearP = makeBear(); bearP.scale.setScalar(2.2); bearP.position.set(-2.1, 0, 1.2); bearP.rotation.y = 0.6; g.add(bearP); T.circ(-2.1, 1.2, 0.35);
+      const gingP = makeGinger(); gingP.scale.setScalar(2.4); gingP.position.set(1.5, 0, 0.7); gingP.rotation.y = -0.5; g.add(gingP); T.circ(1.5, 0.7, 0.3);
+      const snP = makeSnowman(0.28); snP.position.set(1.7, 0, -1.9); snP.rotation.y = -0.4; g.add(snP); T.circ(1.7, -1.9, 0.28);
+      const pg = new THREE.Group(); pg.position.set(-1.9, 0, -1.6); pg.rotation.y = 0.8; g.add(pg);
+      const pb = mesh(new THREE.SphereGeometry(0.22, 14, 12), mat('#2a2f45', { roughness: 0.9 }), 0, 0.26, 0); pb.scale.set(1, 1.25, 0.95); pg.add(pb);
+      const pbl = mesh(new THREE.SphereGeometry(0.17, 14, 12), mat('#fbf8f0', { roughness: 0.9 }), 0, 0.24, 0.07); pbl.scale.set(1, 1.2, 0.9); pg.add(pbl);
+      for (const sx of [-0.07, 0.07]) pg.add(mesh(new THREE.SphereGeometry(0.02, 6, 5), mat('#1c1820'), sx, 0.42, 0.18));
+      const pk = mesh(new THREE.ConeGeometry(0.04, 0.09, 8), mat('#f2a33a'), 0, 0.37, 0.22); pk.rotation.x = Math.PI / 2; pg.add(pk);
+      pg.add(mesh(new THREE.TorusGeometry(0.15, 0.04, 6, 14), mat('#d63a3a'), 0, 0.33, 0).rotateX(Math.PI / 2));
+      T.circ(-1.9, -1.6, 0.28);
+      const rug2 = mesh(new THREE.CircleGeometry(1.5, 36), new THREE.MeshStandardMaterial({ color: '#c0392b', roughness: 1, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }), 0, 0.012, -0.5);
+      rug2.position.z = 0; rug2.rotation.x = -Math.PI / 2; rug2.scale.y = 0.75; rug2.castShadow = false; g.add(rug2);
+      T.scarf = mesh(new THREE.BoxGeometry(0.16, 1, 0.03).translate(0, -0.5, 0), new THREE.MeshStandardMaterial({ map: stripeTex('#d63a3a', '#ffffff', 8, true), roughness: 1 }), 0, 0, 0);
+      T.scarf.visible = false;
+      T.knit = 0;
+      T.tableFront = roomV(-3.45, 1.5); T.chairStand = roomV(1.15, -0.8);
+    },
+    actions(T) {
+      return [
+        [`🎨 포장지: ${PAPERS[T.pi][0]}`, () => { T.pi = (T.pi + 1) % PAPERS.length; T.roll.material = T.sheet.material = mat(PAPERS[T.pi][1], { roughness: 0.7 }); noiseHit({ freq: 3000, q: 0.6, vol: 0.04, dur: 0.15 }); refreshPanel(true); }],
+        [`🎀 리본: ${RIBBONS[T.ri][0]}`, () => { T.ri = (T.ri + 1) % RIBBONS.length; T.spool.material = mat(RIBBONS[T.ri][1], { roughness: 0.4 }); tone(988, 0.03, 0.3); refreshPanel(true); }],
+        ['🎁 선물 포장하기', () => wrapGift(T)],
+        ['🧶 흔들의자에서 뜨개질', () => knitScarf(T)],
+      ];
+    },
+    sitActions() { return []; },
+    update(T, dt, t) {
+      if (sitting === 'knit') {
+        T.chair.rotation.z = Math.sin(t * 1.4) * 0.06;
+        T.knit = Math.min(1, T.knit + dt / 9);
+        // 한 코 뜨기 — 오른쪽 바늘이 왼쪽 바늘 코에 쏙 들어갔다(앞 · 아래로) 실을 걸고 빠져나옴
+        const st = (t * 1.6) % 1;
+        const dip = Math.sin(st * Math.PI);
+        T.rNeedle.rotation.z = -0.35 + dip * 0.3;
+        T.rNeedle.rotation.y = -0.25 + dip * 0.35;
+        T.wrap.visible = st < 0.7;
+        T.fabric.scale.y = 0.05 + T.knit * 0.3;
+        T.stitches.forEach((sti, k) => { sti.position.x = -0.1 + k * 0.022 + ((t * 1.6) % 1) * 0.022; });   // 코가 한 칸씩 오른쪽 바늘 쪽으로 넘어감
+        // 실타래가 풀리며 빙글빙글 · 실 한 가닥이 바구니에서 손까지 (가운데가 살짝 처지게)
+        T.yarn.rotation.x += dt * 2.2; T.yarn.rotation.y += dt * 1.3;
+        T.yarn.scale.setScalar(1 - T.knit * 0.35);
+        T.kg.updateMatrixWorld(true);
+        const hA = toRoom(T.rNeedle.localToWorld(tmpV.copy(T.rTip))), yA = T.yarn.position;   // 실 끝 = 오른쪽 바늘 끝에 감긴 고리
+        for (let k = 0; k < 12; k++) {
+          const f = k / 11;
+          T.threadPts[k].set(lerp(yA.x, hA.x, f), lerp(yA.y + 0.1, hA.y, f) - Math.sin(f * Math.PI) * (0.18 + Math.sin(t * 3) * 0.03), lerp(yA.z, hA.z, f));
+        }
+        T.thread.geometry.dispose();
+        T.thread.geometry = new THREE.TubeGeometry(new THREE.CatmullRomCurve3(T.threadPts), 24, 0.024, 6, false);
+        T.threadTex.offset.x -= dt * 1.6;   // 실이 실타래에서 풀려 손으로 당겨지는 움직임
+        // 벽난로 불빛이 얼굴에 일렁이게
+        if (Math.random() < dt * 1.5) noiseHit({ freq: 2500 + Math.random() * 3000, q: 1, vol: 0.02, dur: 0.03 });
+        if (Math.random() < dt * 2) noiseHit({ freq: 5200, q: 3, vol: 0.01, dur: 0.03 });
+        if (T.knit >= 1) { T.knit = 0; standUp(); setTimeout(() => receiveGift(GIFT_ITEMS[4]), 200); }
+      } else T.chair.rotation.z = lerp(T.chair.rotation.z, 0, Math.min(1, dt * 3));
+    },
+  });
+  function wrapGift(T) {
+    if (T.wrapping) return;
+    if (sitting) standUp();
+    walkThen(T.tableFront, () => {
+      T.wrapping = true;
+      faceTo(player, roomV(-4.75, 1.5));
+      faceCam(1.0, 4.6, 0.45);
+      const item = pick(GIFT_ITEMS);
+      const toy = item.make();
+      toy.scale.setScalar(1.4);
+      toy.position.set(-0.15, 0.89, 0.15);
+      T.tbl.add(toy);
+      player.userData.gesture = { type: 'reach', t: 0, dur: 1.6 };
+      for (let i = 0; i < 4; i++) noiseHit({ freq: 2800 + i * 300, q: 0.5, vol: 0.05, dur: 0.18, when: 0.3 + i * 0.28 });
+      setTimeout(() => {
+        T.tbl.remove(toy);
+        const n = T.wrapped.length;
+        const pile = (i) => new THREE.Vector3(0.65 + (i % 2) * 0.38, 0.88 + Math.floor(i / 2) * 0.32, 0.05 + (i % 3) * 0.1);
+        if (n >= 6) { T.tbl.remove(T.wrapped.shift()); T.wrapped.forEach((b, i) => b.position.copy(pile(i))); }
+        const box = makeGift(0.34, 0.3, 0.34, PAPERS[T.pi][1], RIBBONS[T.ri][1]);
+        const k = T.wrapped.length;
+        box.position.copy(pile(k));
+        box.rotation.y = (rnd() - 0.5) * 0.5;
+        T.tbl.add(box); T.wrapped.push(box);
+        T.tbl.updateMatrixWorld(true);
+        puff(T.tbl.localToWorld(new THREE.Vector3(-0.15, 1.0, 0.15)), { n: 8, color: '#fff6c8', size: 0.25, spread: 0.4 });
+        sparkle();
+        toast(`🎁 ${josa(item.name, '을', '를')} ${PAPERS[T.pi][0]} 포장지에 ${RIBBONS[T.ri][0]} 리본으로 포장했어요!`);
+        T.wrapping = false;
+      }, 1600);
+    });
+  }
+  function knitScarf(T) {
+    walkThen(T.chairStand, () => {
+      sitThemed('knit', roomV(0, 0.17), Math.PI, 0.37, T.chairStand, () => {
+        player.userData.armsMode = null; T.scarf.visible = false; if (T.scarf.parent) T.scarf.parent.remove(T.scarf);
+        if (T.kg.parent) T.kg.parent.remove(T.kg);
+        T.thread.visible = false;
+      });
+      const u = player.userData;
+      T.kg.position.set(0, 0.24, 0.36); T.kg.rotation.set(-0.35, 0, 0);   // 가슴 앞, 무릎 쪽으로 살짝 기울여
+      u.upper.add(T.kg);
+      T.fabric.scale.y = 0.05;
+      T.thread.visible = true;
+      player.userData.armsMode = 'knit';
+      T.knit = 0;
+      faceCam(0.75, 3.4, 0.3);   // 앞옆에서 — 뜨는 손 · 실 · 얼굴, 뒤로 벽난로 불빛
+      toast('🧶 따뜻한 벽난로 앞에서 한 땀 한 땀… 목도리를 뜨는 중 (다 뜨면 선물로!)');
+    });
+  }
+
+  function setRoom(id) {
+    curTheme = id;
+    shopStuff.visible = id === 'workshop'; shopBanner.visible = id === 'workshop';
+    for (const b of shopBlocks) b.off = id !== 'workshop';
+    homeStuff.visible = id === 'living';
+    for (const b of homeBlocks) b.off = id !== 'living';
+    for (const k in THEMES) { const T = THEMES[k]; T.g.visible = k === id; for (const b of T.blocks) b.off = k !== id; }
+    INTS.cornerTree.visible = true; INTS.cornerBlock.off = false;
+    INTS.lamp.intensity = 10;
+    if (THEMES[id] && THEMES[id].enter) THEMES[id].enter(THEMES[id]);
+  }
   const chimneys = [];
   for (const [x, z, wall, roof] of HOUSES_AT) {
     const hz = makeHouse({ w: 5 + rnd() * 1.4, d: 4.6 + rnd(), h: 3 + rnd() * 0.6, wall, roof, door: pick(['#2f6b4a', '#b93b3b', '#3a5a8a']) });
     placeHouse(hz, x, z);
-    registerHouse(hz, HOUSE_NAMES[HOUSE_LIST.length], wall);
+    registerHouse(hz, HOUSE_NAMES[HOUSE_LIST.length], wall, false, HOUSE_THEMES[HOUSE_LIST.length]);
     if (rnd() < 0.6) chimneys.push(hz.localToWorld(hz.userData.chimney.clone()));
   }
 
@@ -1721,7 +3247,9 @@
       lamps.push(new THREE.Vector3(x, 3.3, z));
     }
     // 가로등 → 트리 꼭대기로 이어지는 줄 전구 (광장을 덮는 지붕처럼)
-    for (const l of lamps) bulbLine(l, new THREE.Vector3(l.x * 0.12, 9.6, l.z * 0.12), -0.6, 22);
+    // 가로등 → 트리 꼭대기 줄 전구 — 무지개 색으로 한 줄씩 번갈아 켜짐 (strand 번호)
+    lamps.forEach((l, k) => bulbLine(l, new THREE.Vector3(l.x * 0.12, 9.6, l.z * 0.12), -0.6, 22, BULB_COLORS, k));
+    STRANDS = lamps.length;
     // 길 입구마다 지팡이 사탕 한 쌍
     for (const p of PLACES) {
       if (!p.pathLen) continue;
@@ -1775,13 +3303,23 @@
   }
 
   // 줄 전구 한꺼번에
-  let bulbIM2 = null;
+  let bulbIM2 = null, strandGlow = null;
   {
     const n = bulbPts.length;
     bulbIM2 = new THREE.InstancedMesh(new THREE.SphereGeometry(0.075, 8, 6), new THREE.MeshBasicMaterial({ toneMapped: false }), n);
     const d = new THREE.Object3D();
     bulbPts.forEach((b, i) => { d.position.copy(b.p); d.updateMatrix(); bulbIM2.setMatrixAt(i, d.matrix); bulbIM2.setColorAt(i, b.c); });
     scene.add(bulbIM2);
+    // 줄 전구마다 은은한 빛무리 — 가로등 ↔ 트리 지붕 줄 · 집 처마 · 작은 트리
+    const gp = [], gc = [], gph = [];
+    const sp = [], sc = [], sph = [];
+    bulbPts.forEach((b, i) => {
+      if (b.strand >= 0) { b.gi = sp.length / 3; sp.push(b.p.x, b.p.y, b.p.z); sc.push(b.c); sph.push(b.ph); }
+      else { gp.push(b.p.x, b.p.y, b.p.z); gc.push(b.c); gph.push(b.ph); }
+    });
+    scene.add(makeGlowPoints(gp, gc, gph, 0.55, true).points);
+    strandGlow = makeGlowPoints(sp, sc, sph, 0.7, false);   // 색을 매 프레임 직접 바꿈
+    scene.add(strandGlow.points);
     // 전선 — 아주 가는 선
     const wg = new THREE.BufferGeometry().setFromPoints(wirePts);
     scene.add(new THREE.LineSegments(wg, new THREE.LineBasicMaterial({ color: '#2a3a30', transparent: true, opacity: 0.75 })));
@@ -2103,7 +3641,7 @@
     const air = u.airAmt;
     if (u.pose === 'sit') rootY = -0.3;
     if (u.pose === 'crouch') { rootY = -0.52; upperRx += 0.18; }
-    let waveAmt = 0, bowAmt = 0, danceAmt = 0, throwAmt = 0, throwT = 0, cheerAmt = 0, joyAmt = 0, hop = 0;
+    let waveAmt = 0, bowAmt = 0, danceAmt = 0, throwAmt = 0, throwT = 0, cheerAmt = 0, joyAmt = 0, hop = 0, reachAmt = 0, hangAmt = 0, pressAmt = 0, pressT = 0;
     if (u.gesture) {
       u.gesture.t += dt;
       const dur = u.gesture.dur || 2.2, gt = u.gesture.t;
@@ -2113,6 +3651,9 @@
       if (u.gesture.type === 'wave') waveAmt = env;
       if (u.gesture.type === 'dance') danceAmt = env;
       if (u.gesture.type === 'cheer') cheerAmt = env;
+      if (u.gesture.type === 'press') { pressAmt = env; pressT = gt; upperRx += 0.4 * pressAmt; }
+      if (u.gesture.type === 'hang') { hangAmt = env; upperRx += 0.18 * hangAmt; }
+      if (u.gesture.type === 'reach') { reachAmt = Math.sin(Math.min(1, gt / dur) * Math.PI); upperRx += 0.45 * reachAmt; }
       if (u.gesture.type === 'joy') { joyAmt = env; hop = Math.abs(Math.sin(gt * Math.PI / 0.55)) * (gt < dur - 0.3 ? 1 : 0); }
       if (u.gesture.type === 'throw') { throwAmt = 1 - smooth(0.75, 1.0, gt); throwT = gt; }
       if (gt > dur) u.gesture = null;
@@ -2136,6 +3677,7 @@
       if (air > 0.02) { hr = lerp(hr, -0.55 + sgn * 0.1, air); kr = lerp(kr, 1.0, air); }
       if (joyAmt > 0.02) { hr = lerp(hr, -0.5 * hop, joyAmt); kr = lerp(kr, 0.9 * hop, joyAmt); }
       if (u.pose === 'sit') { hr = -1.3; kr = 1.4; hz = 0; }
+      if (u.pose === 'lie') { hr = 0; kr = 0.05; hz = 0; }
       if (u.pose === 'crouch') { hr = -1.45 + sgn * 0.12; kr = 1.95; }
       if (danceAmt > 0.02 && u.pose === 'stand') {
         hr = lerp(hr, -0.12 + Math.sin(beat * 0.5 + i * Math.PI) * 0.28, danceAmt);
@@ -2151,8 +3693,16 @@
       if (air > 0.02) { rz = lerp(rz, sgn * 1.1, air); rx = lerp(rx, -0.3, air); er = lerp(er, -0.5, air); }
       if (u.carry) { rx = -1.05; rz = sgn * 0.1; er = -0.75; }
       if (u.push) { rx = -1.25; rz = sgn * 0.12; er = -0.15; }
+      if (pressAmt > 0.02) { rx = lerp(rx, -0.75 - Math.max(0, Math.sin(pressT * 14)) * 0.12, pressAmt); rz = lerp(rz, sgn * -0.08, pressAmt); er = lerp(er, -0.35, pressAmt); }
+      if (hangAmt > 0.02 && i === 1) { rx = lerp(rx, -1.4, hangAmt); rz = lerp(rz, sgn * 0.05, hangAmt); er = lerp(er, -0.12, hangAmt); }   // 앞으로 쭉 뻗어 가지 끝에
+      if (reachAmt > 0.02 && i === 1) { rx = lerp(rx, -1.25, reachAmt); rz = lerp(rz, sgn * -0.05, reachAmt); er = lerp(er, -0.1, reachAmt); }
       if (sk > 0.02) { rx = lerp(rx, -0.2 + Math.sin(u.gait + i * Math.PI) * 0.25, sk); rz = lerp(rz, sgn * 0.75, sk); er = lerp(er, -0.2, sk); }
       if (u.pose === 'sit') { rx = -0.35; rz = sgn * 0.2; er = -0.5; }
+      if (u.pose === 'lie') { rx = 0.1; rz = sgn * 0.18; er = -0.2; }
+      if (u.armsMode === 'piano') { rx = -1.1 + Math.sin(u.t * 9 + i * 2.1) * 0.12; rz = sgn * 0.28; er = -0.45 + Math.sin(u.t * 11 + i) * 0.08; }
+      if (u.armsMode === 'write' && i === 1) { rx = -1.0; rz = sgn * -0.1 + Math.sin(u.t * 10) * 0.05; er = -0.8 + Math.sin(u.t * 7) * 0.1; }
+      if (u.armsMode === 'bells') { const ph = u.t * 9.8 + i * Math.PI; rx = -1.0 + Math.max(0, Math.sin(ph)) * -0.55; rz = sgn * 0.22; er = -0.7 + Math.sin(ph) * 0.25; }   // 왼손 · 오른손 번갈아 위로
+      if (u.armsMode === 'knit') { rx = -0.75 + Math.sin(u.t * 8 + i * Math.PI) * 0.08; rz = sgn * -0.22; er = -1.3; }
       if (u.pose === 'crouch') { rx = -0.9 + Math.sin(u.t * 6 + i) * 0.15; rz = sgn * 0.2; er = -0.3; }
       if (u.drink > 0 && i === 1) {
         const cyc = u.drink % 4;
@@ -2182,7 +3732,7 @@
         rz = lerp(rz, sgn * 0.25, throwAmt);
       }
       if (bowAmt > 0.02) { rx = -0.42 * bowAmt; rz = sgn * (0.1 + 0.12 * bowAmt); er = -0.5 - 0.5 * bowAmt; }
-      if (joyAmt > 0.02) { rz = lerp(rz, sgn * (u.carry ? 2.75 : 2.5 + Math.sin(u.t * 14) * 0.25), joyAmt); rx = lerp(rx, u.carry ? -0.25 : -0.15, joyAmt); er = lerp(er, u.carry ? -0.6 : -0.2, joyAmt); }
+      if (joyAmt > 0.02) { rz = lerp(rz, sgn * (u.carry ? 2.55 : 2.5 + Math.sin(u.t * 14) * 0.25), joyAmt); rx = lerp(rx, u.carry ? -0.75 : -0.15, joyAmt); er = lerp(er, u.carry ? -0.6 : -0.2, joyAmt); }
       u.arms[i].sh.rotation.x = lerp(u.arms[i].sh.rotation.x, rx, k);
       u.arms[i].sh.rotation.z = lerp(u.arms[i].sh.rotation.z, rz, k);
       u.arms[i].elbow.rotation.x = lerp(u.arms[i].elbow.rotation.x, er, k);
@@ -2192,7 +3742,7 @@
     const bob = skating ? 0 : w * Math.abs(Math.sin(u.gait)) * 0.055 + (1 - w) * Math.sin(u.t * 1.5) * 0.012;
     u.inner.position.y = lerp(u.inner.position.y, rootY + bob - sk * 0.08, k);
     u.upper.rotation.x = lerp(u.upper.rotation.x, upperRx + w * 0.08 + sk * 0.22, k);
-    if (u.carry) u.carry.position.set(0, lerp(0.34, 1.35, joyAmt), lerp(0.42, 0.04, joyAmt));
+    if (u.carry) u.carry.position.set(0, lerp(0.34, 1.62, joyAmt), lerp(0.42, 0.34, joyAmt));   // 머리 위 앞쪽 (모자 위로)
     u.body.rotation.z = lerp(u.body.rotation.z, Math.sin(u.gait) * (0.03 + sk * 0.1) * w + Math.sin(beat * 0.5) * 0.11 * danceAmt, k);
     u.inner.rotation.y = lerp(u.inner.rotation.y, Math.sin(beat * 0.25) * 0.45 * danceAmt, k);
     u.head.rotation.x = lerp(u.head.rotation.x, bowAmt * 0.3, k);
@@ -2204,7 +3754,8 @@
       for (const e of u.eyes) e.scale.y = closing ? 0.12 : 1.08;
       if (u.blink < -0.14) u.blink = 2.5 + Math.random() * 4;
     }
-    u.blob.visible = u.pose !== 'sit';
+    u.inner.rotation.x = lerp(u.inner.rotation.x, u.pose === 'lie' ? -Math.PI / 2 : 0, Math.min(1, dt * 6));
+    u.blob.visible = u.pose !== 'sit' && u.pose !== 'lie';
   }
 
   // 손에 드는 코코아
@@ -2363,26 +3914,30 @@
     for (const c of chimneys) puff(c, { n: 1, color: '#f2f2f2', size: 0.7, up: 1.2, spread: 0.25, life: 3.5, opacity: 0.55 });
     for (const s of steamSpots) puff(s, { n: 1, color: '#ffffff', size: 0.35, up: 0.6, spread: 0.1, life: 1.8, opacity: 0.45 });
     const u = player.userData;
-    if (u.cup) { u.cup.getWorldPosition(tmpV); tmpV.y += 0.22; puff(tmpV, { n: 1, size: 0.18, up: 0.4, spread: 0.05, life: 1.2, opacity: 0.4 }); }
+    if (u.cup && !u.cupNoSteam) { u.cup.getWorldPosition(tmpV); tmpV.y += 0.22; puff(tmpV, { n: 1, size: 0.18, up: 0.4, spread: 0.05, life: 1.2, opacity: 0.4 }); }
   }
 
   // 눈뭉치
   const balls = [];
   const ballGeo = new THREE.SphereGeometry(0.12, 10, 8);
+  // 눈 뿌리기 — 허리 숙여 눈을 한 움큼 떠서, 두 팔로 하늘 위로 흩뿌립니다 (누구에게 던지는 게 아니라 눈놀이)
   function throwSnowball(av) {
     const u = av.userData;
-    u.gesture = { type: 'throw', t: 0, dur: 0.9 };
-    if (av === player) faceCam(1.45, 6, 0.22);
+    if (u.gesture && (u.gesture.type === 'bow' || u.gesture.type === 'cheer')) return;
+    if (av === player) faceCam(0.6, 6, 0.22);
+    u.gesture = { type: 'bow', t: 0, dur: 0.55 };
+    setTimeout(() => crunch(1.2), 200);
     setTimeout(() => {
-      const b = mesh(ballGeo, snowM);
-      u.arms[1].elbow.getWorldPosition(b.position);
-      b.position.y += 0.1;
-      const ry = av.rotation.y;
-      const v = new THREE.Vector3(Math.sin(ry) * 9, 5.2, Math.cos(ry) * 9);
-      scene.add(b);
-      balls.push({ b, v });
+      u.gesture = { type: 'cheer', t: 0, dur: 1.1 };
       whoosh();
-    }, 420);
+      setTimeout(() => {
+        av.getWorldPosition(tmpV);
+        const top = tmpV.clone().setY(tmpV.y + 2.6);
+        puff(top, { n: 16, color: '#ffffff', size: 0.32, up: 1.6, spread: 1.7, life: 1.6, opacity: 0.9 });
+        puff(top, { n: 10, color: '#e6f3ff', size: 0.14, up: 2.4, spread: 2.2, life: 2.0, opacity: 1 });
+        for (let i = 0; i < 5; i++) tone(1568 + i * 220, 0.02, 0.6, i * 0.06);
+      }, 220);
+    }, 520);
   }
   function updateBalls(dt) {
     for (let i = balls.length - 1; i >= 0; i--) {
@@ -2520,6 +4075,7 @@
     ensureAudio();
     if (!actx) return;
     stopSong();
+    bgmDuck(true);   // 오르골이 나오는 동안 배경음악은 잠시 쉼
     const s = SONGS[songI % SONGS.length];
     songBus = actx.createGain();
     songBus.gain.value = 1;
@@ -2533,7 +4089,7 @@
     }
     songPlaying = true;
     toast(`🎶 오르골 — ${s.name}`);
-    songTimer = setTimeout(() => { songPlaying = false; songI++; refreshPanel(true); }, (t + 1.5) * 1000);
+    songTimer = setTimeout(() => { songPlaying = false; songI++; bgmDuck(false); refreshPanel(true); }, (t + 1.5) * 1000);
     refreshPanel(true);
   }
   function stopSong() {
@@ -2545,6 +4101,128 @@
       songBus = null;
     }
     songPlaying = false;
+    bgmDuck(false);
+  }
+
+  // ------------------------------------------------------------------
+  // 배경음악 — 저작권이 끝난 옛 캐럴을 잔잔하게 편곡해 코드로 연주합니다
+  //   (고요한 밤 1818 · 덱 더 홀 웨일스 민요 · 징글벨 1857 · We Wish You 영국 민요)
+  //   맑은 멜로디 + 낮은 베이스 + 아주 작은 분산화음, 살짝 메아리. 지속음(드론) 없이 모두 사라지는 소리.
+  //   곡 사이에는 몇 초 쉬고 다음 곡으로 넘어갑니다. 오르골이 나오는 동안에는 잠시 줄어듭니다.
+  // ------------------------------------------------------------------
+  const CH_ROOT = { C: 48, D: 50, E: 52, F: 53, G: 55, A: 57, B: 59 };
+  const chordNotes = (name) => {
+    const r = CH_ROOT[name[0]], q = name.slice(1);
+    const n = [r, r + (q.startsWith('m') ? 3 : 4), r + 7];
+    if (q.includes('7')) n.push(r + 10);
+    return n;
+  };
+  const DECK = [
+    [67, 1.5], [65, 0.5], [64, 1], [62, 1], [60, 1], [62, 1], [64, 1], [60, 1], [62, 0.5], [64, 0.5], [65, 0.5], [62, 0.5], [64, 1.5], [62, 0.5], [60, 1], [59, 1], [60, 2],
+    [67, 1.5], [65, 0.5], [64, 1], [62, 1], [60, 1], [62, 1], [64, 1], [60, 1], [62, 0.5], [64, 0.5], [65, 0.5], [62, 0.5], [64, 1.5], [62, 0.5], [60, 1], [59, 1], [60, 2],
+    [62, 1.5], [64, 0.5], [65, 1], [62, 1], [64, 1.5], [65, 0.5], [67, 1], [62, 1], [64, 0.5], [66, 0.5], [67, 1], [69, 0.5], [71, 0.5], [72, 1], [71, 1], [69, 1], [67, 2],
+    [67, 1.5], [65, 0.5], [64, 1], [62, 1], [60, 1], [62, 1], [64, 1], [60, 1], [69, 0.5], [69, 0.5], [69, 0.5], [69, 0.5], [67, 1.5], [65, 0.5], [64, 1], [62, 1], [60, 2],
+  ];
+  const DECK_A = [['C', 4], ['C', 4], ['G7', 2], ['C', 2], ['C', 1], ['G7', 1], ['C', 2]];
+  const BGM = [
+    { name: '고요한 밤', bpm: 64, beatsPer: 3, oct: 0, melody: SONGS[2].notes,
+      chords: [['C', 6], ['C', 6], ['G7', 6], ['C', 6], ['F', 6], ['C', 6], ['F', 6], ['C', 6], ['G7', 6], ['C', 6], ['C', 3], ['G7', 3], ['C', 6]] },
+    { name: '덱 더 홀', bpm: 92, beatsPer: 4, oct: 12, melody: DECK,
+      chords: [...DECK_A, ...DECK_A, ['G7', 4], ['C', 2], ['G', 2], ['G', 2], ['D7', 2], ['G', 4], ['C', 4], ['C', 4], ['F', 4], ['C', 1], ['G7', 1], ['C', 2]] },
+    { name: '징글벨', bpm: 104, beatsPer: 4, oct: 0, melody: SONGS[0].notes,
+      chords: [['C', 4], ['C', 4], ['C', 4], ['C', 4], ['F', 4], ['C', 4], ['D7', 4], ['G7', 4], ['C', 4], ['C', 4], ['C', 4], ['C', 4], ['F', 4], ['C', 4], ['G7', 4], ['C', 4]] },
+    { name: '위 위시 유 어 메리 크리스마스', bpm: 92, beatsPer: 3, oct: 0, melody: SONGS[1].notes,
+      chords: [['_', 1], ['C', 3], ['F', 3], ['D7', 3], ['G', 3], ['E7', 3], ['Am', 3], ['F', 1], ['G7', 2], ['C', 3]] },
+  ];
+  let bgmOn = localStorage.getItem('santa.bgm') !== 'off', bgmBus = null, bgmTimer = null, bgmQ = [], bgmI = 0, bgmEnd = 0, bgmDucked = false, bgmName = '';
+  function bgmVoice(f, vol, t0, dur, { attack = 0.02, partial = 0.25, type = 'sine' } = {}) {
+    const g = actx.createGain();
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(vol, t0 + attack);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    g.connect(bgmBus);
+    const o = actx.createOscillator();
+    o.type = type; o.frequency.value = f;
+    o.connect(g); o.start(t0); o.stop(t0 + dur + 0.05);
+    if (partial > 0) {   // 2배음을 살짝 — 맑은 첼레스타 · 피아노 느낌
+      const g2 = actx.createGain();
+      g2.gain.setValueAtTime(0.0001, t0);
+      g2.gain.exponentialRampToValueAtTime(vol * partial, t0 + attack);
+      g2.gain.exponentialRampToValueAtTime(0.0001, t0 + dur * 0.45);
+      g2.connect(bgmBus);
+      const o2 = actx.createOscillator();
+      o2.frequency.value = f * 2;
+      o2.connect(g2); o2.start(t0); o2.stop(t0 + dur * 0.45 + 0.05);
+    }
+  }
+  function setupBgmBus() {
+    bgmBus = actx.createGain();
+    bgmBus.gain.value = 0;
+    bgmBus.connect(master);
+    // 메아리 — 짧은 딜레이를 낮은 주파수만 남겨 되돌림 (방 안 울림 같은 공간감)
+    const dl = actx.createDelay(1), fb = actx.createGain(), lp = actx.createBiquadFilter(), wet = actx.createGain();
+    dl.delayTime.value = 0.34; fb.gain.value = 0.3; lp.type = 'lowpass'; lp.frequency.value = 2200; wet.gain.value = 0.28;
+    bgmBus.connect(dl); dl.connect(lp); lp.connect(fb); fb.connect(dl); lp.connect(wet); wet.connect(master);
+  }
+  function queueSong(t0) {
+    const s = BGM[bgmI % BGM.length];
+    bgmI++;
+    bgmName = s.name;
+    musicLabel();
+    const beat = 60 / s.bpm;
+    let t = 0;
+    for (const [m, b] of s.melody) {
+      bgmQ.push({ at: t0 + t * beat, f: midi(m + s.oct), vol: 0.085, dur: Math.max(0.6, b * beat * 1.7), kind: 'mel' });
+      t += b;
+    }
+    let tc = 0;
+    const pat = s.beatsPer === 3 ? [0, 1, 2] : [0, 2, 1, 2];
+    for (const [c, b] of s.chords) {
+      if (c !== '_') {
+        const ns = chordNotes(c);
+        bgmQ.push({ at: t0 + tc * beat, f: midi(ns[0] - 12), vol: 0.09, dur: Math.max(1.2, b * beat), kind: 'bass' });
+        for (let k = 0; k < Math.round(b); k++) {
+          bgmQ.push({ at: t0 + (tc + k) * beat + 0.02, f: midi(ns[pat[k % pat.length]] + 12), vol: 0.024, dur: beat * 1.8, kind: 'arp' });
+        }
+      }
+      tc += b;
+    }
+    bgmQ.sort((a, b) => a.at - b.at);
+    bgmEnd = t0 + Math.max(t, tc) * beat;
+  }
+  function bgmPump() {
+    if (!actx || !bgmBus || actx.state !== 'running') return;
+    const now = actx.currentTime;
+    if (!bgmQ.length && now > bgmEnd - 0.3) queueSong(Math.max(now + 0.4, bgmEnd + 4));   // 곡 사이 4초 쉼
+    while (bgmQ.length && bgmQ[0].at < now + 1.2) {
+      const e = bgmQ.shift();
+      if (e.at < now - 0.05) continue;
+      if (e.kind === 'mel') bgmVoice(e.f, e.vol, e.at, e.dur, { attack: 0.012, partial: 0.28 });
+      else if (e.kind === 'bass') bgmVoice(e.f, e.vol, e.at, e.dur, { attack: 0.06, partial: 0.15 });
+      else bgmVoice(e.f, e.vol, e.at, e.dur, { attack: 0.03, partial: 0.1 });
+    }
+  }
+  function bgmLevel() {
+    if (!bgmBus) return;
+    const v = bgmOn && !bgmDucked ? 0.75 : 0;
+    bgmBus.gain.setTargetAtTime(v, actx.currentTime, bgmDucked ? 0.25 : 0.8);
+  }
+  function bgmDuck(on) { bgmDucked = on; bgmLevel(); }
+  function startBgm() {
+    ensureAudio();
+    if (!actx || bgmTimer) return;
+    setupBgmBus();
+    bgmI = Math.floor(Math.random() * BGM.length);
+    bgmEnd = actx.currentTime - 10;
+    bgmTimer = setInterval(bgmPump, 200);
+    bgmLevel();
+  }
+  function musicLabel() {
+    const b = document.getElementById('btn-music');
+    if (!b) return;
+    b.innerHTML = bgmOn ? '🎵<span> 음악 켜짐</span>' : '🎵<span> 음악 꺼짐</span>';
+    b.classList.toggle('off', !bgmOn);
+    b.title = bgmOn && bgmName ? `지금 흐르는 곡: ${bgmName}` : '배경음악 켜기 / 끄기';
   }
 
   // ------------------------------------------------------------------
@@ -2553,24 +4231,60 @@
   const MODES = ['반짝반짝', '물결', '무지개', '금빛'];
   const WISH_KEY = 'santa.wishes';
   const wishMeshes = [];
+  const WISH_MAX = 16;
+  let pickedWish = null;
+  const saveWishes = () => localStorage.setItem(WISH_KEY, JSON.stringify(wishes.slice(-60)));
+  function removeWish(w, quiet) {
+    const i = wishes.indexOf(w);
+    if (i >= 0) wishes.splice(i, 1);
+    const k = wishMeshes.findIndex((m) => m.userData.w === w);
+    if (k >= 0) {
+      const g = wishMeshes[k].parent;
+      g.getWorldPosition(tmpV);
+      if (!quiet) { puff(tmpV.clone(), { n: 10, color: '#ffc2d8', size: 0.3, spread: 0.6, life: 0.9 }); tone(784, 0.04, 0.5); tone(523, 0.03, 0.6, 0.1); }
+      scene.remove(g);
+      wishMeshes.splice(k, 1);
+    }
+    if (pickedWish === w) pickedWish = null;
+    saveWishes();
+    refreshPanel(true);
+  }
+  // 오너먼트 고르기 — 작은 공이라 광선이 공 중심 0.4m 안을 지나면 누른 것으로
+  function pickWishByRay(r) {
+    let best = null, bd = 0.4;
+    for (const m of wishMeshes) {
+      m.getWorldPosition(tmpV);
+      const d = r.ray.distanceToPoint(tmpV);
+      if (d < bd) { bd = d; best = m; }
+    }
+    return best;
+  }
   function addWishOrnament(w, fresh) {
     const y = w.y, a = w.a;
-    const r = treeRadiusAt(y) + 0.12;
+    const r = w.r || treeRadiusAt(y) + 0.12;   // 직접 건 오너먼트는 손이 닿는 아래쪽 가지 끝(w.r)
     const g = new THREE.Group();
     g.position.set(Math.cos(a) * r, y, Math.sin(a) * r);
     const ball = mesh(new THREE.SphereGeometry(0.24, 18, 14), new THREE.MeshStandardMaterial({ color: '#ff7aa8', roughness: 0.2, metalness: 0.4, emissive: '#ff4d8d', emissiveIntensity: 0.35 }));
     g.add(ball);
     g.add(mesh(new THREE.CylinderGeometry(0.06, 0.06, 0.08, 10), mat('#e8b23a', { metalness: 0.8, roughness: 0.3 }), 0, 0.26, 0));
     const heart = new THREE.Sprite(new THREE.SpriteMaterial({ map: softTex, color: '#ffc2d8', transparent: true, opacity: 0.6, depthWrite: false, blending: THREE.AdditiveBlending }));
-    heart.scale.setScalar(1.0);
+    heart.scale.setScalar(0.75);
     g.add(heart);
+    g.userData.heart = heart;
+    if (w.r) g.add(mesh(new THREE.CylinderGeometry(0.012, 0.012, 0.32, 5), mat('#e8b23a', { metalness: 0.8, roughness: 0.3 }), 0, 0.44, 0));   // 가지 끝에 거는 짧은 고리 (윗부분은 가지 속으로)
     ball.userData.wish = w.text;
+    ball.userData.w = w;
     scene.add(g);
     wishMeshes.push(ball);
     if (fresh) { g.scale.setScalar(0.01); g.userData.grow = 0; }
     return g;
   }
   const wishes = (() => { try { return JSON.parse(localStorage.getItem(WISH_KEY) || '[]'); } catch { return []; } })();
+  // 예전에 직접 건 오너먼트(가지 위 허공 높이 1.5~1.8)는 가지 끝 밑으로 옮겨 둡니다
+  if (wishes.some((w) => w.r && w.y > 1.3)) {
+    for (const w of wishes) if (w.r && w.y > 1.3) { w.y = 1.02; w.r = 4.12; }
+    localStorage.setItem(WISH_KEY, JSON.stringify(wishes));
+  }
   const growing = [];
   for (const w of wishes) addWishOrnament(w, false);
 
@@ -2601,6 +4315,7 @@
   ];
   function openGift() {
     if (giftOpen.t >= 0) return;
+    if (Math.hypot(player.position.x - WS.go[0], player.position.z - WS.go[1]) > 0.8) { walkThen(new THREE.Vector3(WS.go[0], 0, WS.go[1]), openGift); return; }
     giftOpen.t = 0;
     faceTo(player, WS.giftPos);
     faceCam(1.25, 6, 0.24);
@@ -2787,7 +4502,11 @@
   function standUp() {
     if (!sitting || sitting === 'ride' || sitting === 'roll') return;
     if (sitting === 'sleigh') player.position.set(SL.go[0], 0, SL.go[1]);
-    if (sitting === 'sofa') player.position.z -= 0.95;
+    if (sitting === 'sofa') player.position.set(INT.x + (player.position.x > INT.x ? 2.1 : -2.1), 0, INT.z + 1.35);
+    if (player.userData.standSpot) { player.position.copy(player.userData.standSpot); player.userData.standSpot = null; }
+    player.userData.armsMode = null;
+    if (onStand) { const f = onStand; onStand = null; f(); }
+    player.userData.eating = false;
     sitting = null;
     player.userData.pose = 'stand';
     takeBell(player);
@@ -2803,15 +4522,22 @@
     for (const d of SL.deer) d.userData.excite = 2.2;
   }
   function greetSanta() {
-    santa.userData.gesture = { type: 'wave', t: 0, dur: 2.6 };
-    santa.rotation.y = Math.atan2(player.position.x - santa.position.x, player.position.z - santa.position.z);
-    santa.userData.lookT = 4;
-    faceTo(player, santa.position);
-    faceCam(1.35, 6, 0.22);
-    player.userData.gesture = { type: 'bow', t: 0, dur: 1.6 };
-    sayBubble(santa, pick(['허허허, 메리 크리스마스!', '올해도 착하게 지냈구나!', '루돌프들이 출발 준비 중이란다', '선물은 공방에 많이 있단다, 허허']));
-    jingle(5, 0.05);
+    // 산타 앞(산타가 바라보는 쪽 1.7m)으로 걸어가서 서로 마주 보고 인사
+    const hy = santa.userData.home;
+    const front = new THREE.Vector3(santa.position.x + Math.sin(hy) * 1.7, 0, santa.position.z + Math.cos(hy) * 1.7);
+    pushOut(front);
+    walkThen(front, () => {
+      santa.userData.gesture = { type: 'wave', t: 0, dur: 2.6 };
+      santa.rotation.y = Math.atan2(player.position.x - santa.position.x, player.position.z - santa.position.z);
+      santa.userData.lookT = 4;
+      faceTo(player, santa.position);
+      faceCam(1.35, 6, 0.22);
+      player.userData.gesture = { type: 'bow', t: 0, dur: 1.6 };
+      sayBubble(santa, pick(['허허허, 메리 크리스마스!', '올해도 착하게 지냈구나!', '루돌프들이 출발 준비 중이란다', '선물은 공방에 많이 있단다, 허허']));
+      jingle(5, 0.05);
+    });
   }
+
   // 가게 앞까지 걸어간 뒤에 할 일 (도착하면 실행, 다른 데로 움직이면 취소)
   let pendingAct = null;
   // 집 안 길찾기 — 0.3m 칸으로 나눈 방에서 A* 로 가구를 피해 가는 길, 직선으로 갈 수 있는 점은 건너뜁니다
@@ -2909,18 +4635,30 @@
   const SKATE_MSG = '⛸ 스케이트를 신고는 얼음 밖으로 못 나가요. 먼저 스케이트를 벗어 주세요';
   function toggleSkate() {
     const u = player.userData;
-    if (!u.skate && !onIce(player.position.x, player.position.z)) {
-      // 얼음 가장자리 안쪽(플레이어에게 가장 가까운 곳)으로 걸어가서 신습니다
-      const a = Math.atan2((player.position.z - POND.z) / POND.rz, (player.position.x - POND.x) / POND.rx);
-      walkThen(new THREE.Vector3(POND.x + Math.cos(a) * POND.rx * 0.8, 0, POND.z + Math.sin(a) * POND.rz * 0.8), toggleSkate);
-      return;
+    const a = Math.atan2((player.position.z - POND.z) / POND.rz, (player.position.x - POND.x) / POND.rx);
+    const rim = new THREE.Vector3(POND.x + Math.cos(a) * (POND.rx + 1.6), 0, POND.z + Math.sin(a) * (POND.rz + 1.6));   // 기둥 바깥 — 신으면 얼음 위로, 벗으면 여기로
+    if (!u.skate) {
+      // 얼음 가장자리 바깥까지 걸어가서 → 스케이트를 신고 얼음 위로 한 발
+      if (Math.hypot(player.position.x - rim.x, player.position.z - rim.z) > 0.6) { walkThen(rim, toggleSkate); return; }
+      u.skate = true;
+      player.position.set(POND.x + Math.cos(a) * POND.rx * 0.8, 0, POND.z + Math.sin(a) * POND.rz * 0.8);
+    } else {
+      // 벗으면 가장자리 밖으로 나옴
+      u.skate = false;
+      vel.set(0, 0, 0);
+      player.position.copy(rim);
     }
-    u.skate = !u.skate;
     faceCam(0.9, 5.5, 0.25);
     toast(u.skate ? '⛸ 스케이트를 신었어요! 얼음 위에서 미끄러져 봐요' : '스케이트를 벗었어요');
     refreshPanel(true);
   }
-  function lookTree() { if (sitting) return; faceTo(player, new THREE.Vector3(0, 0, 0)); faceCam(1.3, 9, 0.18); }
+  // 트리를 바라보고, 카메라는 내 뒤 비스듬히 멀리 — 트리 꼭대기 별까지 화면 가운데 크게
+  function lookTree() {
+    if (sitting) return;
+    faceTo(player, new THREE.Vector3(0, 0, 0));
+    const pd = Math.hypot(player.position.x, player.position.z);
+    faceCam(2.75, Math.max(7, 22 - pd), 0.05);
+  }
   function cycleLights() {
     lookTree();
     TREE.mode = (TREE.mode + 1) % MODES.length;
@@ -2928,20 +4666,68 @@
     toast(`✨ 트리 불빛: ${MODES[TREE.mode]}`);
     refreshPanel(true);
   }
+  // 소원 오너먼트 — 소원을 적으면 트리 앞까지 걸어가, 분홍 오너먼트를 손에 들고 가지 끝에 직접 겁니다
+  let hanging = false;
   async function hangWish() {
+    if (hanging || sitting) return;
     const text = await askText();
     if (!text) return;
-    const w = { text: text.slice(0, 40), y: 2.2 + Math.random() * 6.5, a: Math.atan2(player.position.z, player.position.x) + (Math.random() - 0.5) * 1.4 };
-    wishes.push(w);
-    localStorage.setItem(WISH_KEY, JSON.stringify(wishes.slice(-60)));
-    lookTree();
-    const g = addWishOrnament(w, true);
-    growing.push(g);
-    sparkle();
-    confetti(g.position.clone(), 50, 3);
-    toast('💌 소원 오너먼트를 달았어요');
-    refreshPanel(true);
+    // 내가 서 있는 쪽 트리 앞 — 손이 닿는 맨 아래 가지 끝(높이 1.5~1.8)
+    const a = Math.atan2(player.position.z, player.position.x) + (Math.random() - 0.5) * 0.3;
+    // 맨 아래 층 가지 끝(반지름 4.0~4.2, 높이 1.1~1.3) 바로 밑에 매달림 — 손이 닿는 높이
+    const w = { text: text.slice(0, 40), y: 1.02, a, r: 4.12 };
+    const spot = new THREE.Vector3(Math.cos(a) * 5.0, 0, Math.sin(a) * 5.0);
+    hanging = true;
+    walkThen(spot, () => {
+      const u = player.userData;
+      faceTo(player, new THREE.Vector3(0, 0, 0));
+      faceCam(1.85, 10.5, 0.1);   // 멀리 옆에서 낮게 — 큰 트리 아래에서 거는 내 모습과 트리가 함께
+      // 손에 든 오너먼트
+      const held = new THREE.Group();
+      held.add(mesh(new THREE.SphereGeometry(0.17, 16, 12), new THREE.MeshStandardMaterial({ color: '#ff7aa8', roughness: 0.2, metalness: 0.4, emissive: '#ff4d8d', emissiveIntensity: 0.35 })));
+      held.add(mesh(new THREE.CylinderGeometry(0.045, 0.045, 0.06, 10), mat('#e8b23a', { metalness: 0.8, roughness: 0.3 }), 0, 0.19, 0));
+      held.position.set(0, -0.36, 0.05);
+      u.arms[1].elbow.add(held);
+      u.gesture = { type: 'hang', t: 0, dur: 2.2 };   // 팔을 앞 위로 뻗어 가지에 걸기
+      setTimeout(() => {
+        // 손에서 가지 끝으로 — 살짝 흔들리며 걸림
+        held.getWorldPosition(tmpV);
+        const from = tmpV.clone();
+        u.arms[1].elbow.remove(held);
+        wishes.push(w);
+        // 아래 가지가 가득 차지 않게 — 16개가 넘으면 가장 오래된 것부터 떼어 냄
+        while (wishes.filter((x) => x.r).length > WISH_MAX) { const old = wishes.find((x) => x.r); removeWish(old, true); }
+        saveWishes();
+        const g = addWishOrnament(w, false);
+        const to = g.position.clone();
+        g.position.copy(from);
+        g.userData.hang = { t: 0, from, to };
+        hangingOrns.push(g);
+        tone(1318.5, 0.05, 0.9); tone(1760, 0.035, 1.1, 0.1);
+      }, 1050);
+      setTimeout(() => {
+        hanging = false;
+        sparkle();
+        player.getWorldPosition(tmpV);
+        confetti(new THREE.Vector3(Math.cos(a) * 4, 2.4, Math.sin(a) * 4), 40, 2.5);
+        toast('💌 소원 오너먼트를 달았어요! 누르면 소원을 읽을 수 있어요', 3200);
+        refreshPanel(true);
+      }, 1700);
+    });
+    setTimeout(() => { if (hanging && !pendingAct && !player.userData.gesture) hanging = false; }, 8000);
   }
+  const hangingOrns = [];
+  function updateHanging(dt) {
+    for (let i = hangingOrns.length - 1; i >= 0; i--) {
+      const g = hangingOrns[i], h = g.userData.hang;
+      h.t += dt;
+      const k = smooth(0, 0.45, h.t);
+      g.position.lerpVectors(h.from, h.to, k);
+      g.rotation.z = Math.sin(h.t * 9) * 0.35 * Math.max(0, 1 - h.t / 1.6) * k;   // 걸린 뒤 대롱대롱
+      if (h.t > 1.6) { g.rotation.z = 0; hangingOrns.splice(i, 1); }
+    }
+  }
+
   // ------------------------------------------------------------------
   // 집 드나들기
   // ------------------------------------------------------------------
@@ -2955,11 +4741,7 @@
   let inHouse = null, doorBusy = false;
   const knock = () => { noiseHit({ freq: 380, q: 2.5, vol: 0.14, dur: 0.07 }); noiseHit({ freq: 380, q: 2.5, vol: 0.12, dur: 0.07, when: 0.2 }); };
   const creak = () => { if (!actx) return; const t0 = actx.currentTime; const o = actx.createOscillator(), g = actx.createGain(), f = actx.createBiquadFilter(); o.type = 'sawtooth'; o.frequency.setValueAtTime(140, t0); o.frequency.linearRampToValueAtTime(95, t0 + 0.5); f.type = 'bandpass'; f.frequency.value = 900; f.Q.value = 4; g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(0.025, t0 + 0.05); g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.55); o.connect(f); f.connect(g); g.connect(master); o.start(t0); o.stop(t0 + 0.6); };
-  function setWorkshop(on) {
-    shopStuff.visible = on; homeStuff.visible = !on; shopBanner.visible = on;
-    for (const b of shopBlocks) b.off = !on;
-    for (const b of homeBlocks) b.off = on;
-  }
+
   function enterHouse(h) {
     if (doorBusy || inHouse || sitting === 'ride' || sitting === 'roll') return;
     if (player.userData.skate) { toast(SKATE_MSG); return; }
@@ -2972,12 +4754,15 @@
       setTimeout(() => $('#fade').classList.add('on'), 800);
       setTimeout(() => {
         inHouse = h;
-        INSIDE.name = h.name;
-        INSIDE.emoji = h.workshop ? '🎁' : '🏠';
-        INSIDE.desc = h.workshop ? '산타가 준비한 선물이 가득해요! 마음에 드는 받침대 가까이 가 보세요.' : '벽난로가 타닥타닥, 따뜻한 집 안이에요. 소파에 앉아 쉬어 가요.';
+        const TH = THEMES[h.theme];
+        INSIDE.name = TH ? `${h.name} · ${TH.name}` : h.name;
+        INSIDE.emoji = h.workshop ? '🎁' : TH ? TH.emoji : '🏠';
+        INSIDE.desc = h.workshop ? '산타가 준비한 선물이 가득해요! 마음에 드는 받침대 가까이 가 보세요.' : TH ? TH.desc : '';
         intWallMat.color.set(h.wall).lerp(tmpC3.set('#ffffff'), h.workshop ? 0.55 : 0.62);
         intDoorMat.color.set(h.doorColor);
-        setWorkshop(h.workshop);
+        setRoom(h.theme);
+        intTreeOn = true; intTreeLevel = 0;   // 들어가면 아래부터 하나둘 반짝이며 켜짐
+        setTimeout(() => sparkle(), 900);
         player.position.set(INTS.door.x, 0, INTS.door.z);
         player.rotation.y = targetYaw = Math.PI;
         camTarget.set(player.position.x, 1.4, player.position.z);
@@ -2988,7 +4773,7 @@
         $('#fade').classList.remove('on');
         doorBusy = false;
         curPlace = null;
-        toast(h.workshop ? '🎁 산타의 선물 공방에 들어왔어요! 선물을 둘러보세요' : `🏠 ${h.name}에 들어왔어요`);
+        lastDescPlace = null;   // 집 안 설명 토스트가 다시 뜨게
       }, 1250);
     });
   }
@@ -3022,13 +4807,14 @@
   // 집 안 할 일
   function sitSofa() {
     const seat = INTS.seats.reduce((a, b) => (a.distanceTo(player.position) < b.distanceTo(player.position) ? a : b));
-    walkThen(seat.clone().setZ(seat.z - 0.95), () => {
+    const sd = seat.x > INT.x ? 1 : -1;
+    walkThen(new THREE.Vector3(INT.x + sd * 2.1, 0, INT.z + 1.35), () => {
       sitting = 'sofa';
-      player.position.set(seat.x, 0.62 - 0.42, seat.z);
+      player.position.set(seat.x, 0.66 - 0.42, seat.z);   // 쿠션 윗면 0.66
       player.rotation.y = targetYaw = Math.PI;
       player.userData.pose = 'sit';
       faceCam(1.2, 4.4, 0.22);   // 옆에서 — 앉은 얼굴과 벽난로가 함께 보이게
-      toast('🛋 폭신폭신~ 벽난로 불이 따뜻해요');
+      toast('🛋 폭신폭신~ 앞에 놓인 쿠키도 먹어 봐요');
       refreshPanel(true);
     });
   }
@@ -3044,20 +4830,59 @@
     });
   }
   function eatCookie() {
-    walkThen(INTS.table, () => {
-      faceTo(player, new THREE.Vector3(INT.x, 0, INT.z - 0.5));
-      const left = cookies.filter((c) => c.visible);
-      if (!left.length) { for (const c of cookies) c.visible = true; toast('🍪 쿠키를 새로 구웠어요! 다시 눌러 드세요'); sparkle(); return; }
-      left[left.length - 1].visible = false;
-      faceCam(0.9, 3.6, 0.3);   // 앞옆에서 — 쿠키 먹는 얼굴이 보이게
-      player.userData.gesture = { type: 'bow', t: 0, dur: 1.0 };
-      player.getWorldPosition(tmpV); tmpV.y += 1.5;
-      puff(tmpV.clone().add(new THREE.Vector3(Math.sin(player.rotation.y) * 0.3, 0, Math.cos(player.rotation.y) * 0.3)), { n: 6, color: '#c98a4b', size: 0.08, up: -0.5, spread: 0.4, life: 0.8, opacity: 0.9 });
-      for (let i = 0; i < 4; i++) noiseHit({ freq: 2200, q: 0.8, vol: 0.05, dur: 0.05, when: i * 0.16 });
-      toast(left.length > 1 ? '🍪 바삭! 산타 몫은 남겨 둘게요' : '🍪 마지막 쿠키였어요… 산타 미안해요!');
-    });
+    const u = player.userData;
+    if (sitting !== 'sofa' || u.eating) return;
+    const side = player.position.x > INT.x ? 1 : -1;
+    const mine = cookies.filter((c) => c.userData.side === side);
+    const left = mine.filter((c) => c.visible);
+    if (!left.length) { for (const c of mine) c.visible = true; toast('🍪 쿠키를 새로 구웠어요! 다시 눌러 드세요'); sparkle(); return; }
+    u.eating = true;
+    faceCam(0.45, 3.4, 0.3);   // 앞에서 — 쿠키 집어 먹는 얼굴이 보이게
+    u.gesture = { type: 'reach', t: 0, dur: 0.9 };   // 몸을 숙여 바로 앞 접시로 손을 뻗고
+    const ck = left[left.length - 1];
+    setTimeout(() => {
+      if (!u.eating) return;
+      ck.visible = false;
+      const hand = mesh(ck.geometry, ck.material);
+      hand.rotation.x = Math.PI / 2;
+      hand.position.set(0, -0.31, 0.06);
+      u.arms[1].elbow.add(hand);
+      u.cup = hand; u.cupNoSteam = true;
+      u.drink = 3.3;   // 컵 마시기 동작을 빌려 입으로 가져감
+      setTimeout(() => {
+        player.userData.head.getWorldPosition(tmpV);
+        puff(tmpV.clone().add(new THREE.Vector3(Math.sin(player.rotation.y) * 0.25, -0.15, Math.cos(player.rotation.y) * 0.25)), { n: 7, color: '#c98a4b', size: 0.07, up: -0.6, spread: 0.35, life: 0.8, opacity: 0.9 });
+        for (let i = 0; i < 4; i++) noiseHit({ freq: 2200, q: 0.8, vol: 0.05, dur: 0.05, when: i * 0.16 });
+      }, 450);
+      setTimeout(() => {
+        u.eating = false; u.cupNoSteam = false;
+        toast(left.length > 1 ? '🍪 바삭! 산타 몫은 남겨 둘게요' : '🍪 마지막 쿠키였어요… 산타 미안해요!');
+      }, 1500);
+    }, 650);
   }
-  function toggleIntTree() { intTreeOn = !intTreeOn; sparkle(); refreshPanel(true); }
+  function toggleIntTree() {
+    if (!intTreeOn) {
+      // 트리 앞까지 걸어가서 불을 밝힘 — 카메라는 비스듬히 뒤에서 트리가 화면 가운데 오게
+      const tree = new THREE.Vector3(INT.x - INT.W / 2 + 1.3, 0, INT.z - INT.D / 2 + 1.3);
+      const spot = tree.clone().add(new THREE.Vector3(1.55, 0, 1.55));
+      if (sitting) standUp();
+      walkThen(spot, () => {
+        intTreeOn = true;
+        faceTo(player, tree);
+        faceCam(2.55, 5.0, 0.24);
+        sparkle();
+        toast('✨ 트리에 불이 하나둘 켜져요');
+        refreshPanel(true);
+      });
+      return;
+    }
+    intTreeOn = false;
+    {
+      tone(523, 0.04, 0.8); tone(392, 0.035, 1.0, 0.12);
+      toast('🌙 트리 불을 껐어요');
+    }
+    refreshPanel(true);
+  }
 
   // ------------------------------------------------------------------
   // 선물 받기 — 두 손으로 들고 신나서 폴짝폴짝
@@ -3071,6 +4896,16 @@
     puff(tmpV, { n: 8, color: '#fff6c8', size: 0.3, spread: 0.6, life: 0.8 });
     u.carry.parent.remove(u.carry);
     u.carry = null;
+  }
+  // 선물 앞까지 걸어가서 받기 — 공방 앞(바깥) · 받침대 앞(공방 안)
+  function receiveAt(spot, look, item) {
+    walkThen(spot, () => { faceTo(player, look); receiveGift(item); });
+  }
+  function receiveWorkshop() { receiveAt(new THREE.Vector3(WS.go[0], 0, WS.go[1]), WS.giftPos, pick(GIFT_ITEMS)); }
+  function receiveStation(i) { const st = STATIONS[i]; receiveAt(st.spot, st.pos, GIFT_ITEMS[i]); }
+  function receiveNearest() {
+    const st = STATIONS.reduce((a, b) => (a.spot.distanceTo(player.position) < b.spot.distanceTo(player.position) ? a : b));
+    receiveStation(st.i);
   }
   function receiveGift(item) {
     const u = player.userData;
@@ -3113,7 +4948,7 @@
   // ------------------------------------------------------------------
   let ride = null;
   // 비행 중 시점 — 0: 옆 앞에서 (썰매 · 순록 · 마을이 다 보이게)  1: 썰매에 탄 내 눈으로  2: 높이서 넓게
-  const RIDE_CAMS = ['옆에서 보기', '썰매에서 보기', '높이서 보기'];
+  const RIDE_CAMS = ['마을 전경', '썰매에서 보기', '높이서 보기'];
   let rideCam = 0, rideCamReset = true;
   const rideCamPos = new THREE.Vector3(), rideLook = new THREE.Vector3(), rcA = new THREE.Vector3(), rcB = new THREE.Vector3(), rcW = new THREE.Vector3(), rcL = new THREE.Vector3();
   function cycleRideCam() {
@@ -3127,8 +4962,8 @@
     const fw = rcA.set(Math.cos(g.rotation.y), 0, -Math.sin(g.rotation.y));
     const out = rcB.set(pp.x, 0, pp.z).normalize();
     if (rideCam === 0) {
-      rcW.copy(pp).addScaledVector(out, 8).addScaledVector(fw, 7.5); rcW.y += 3.2;
-      rcL.copy(pp).lerp(tmpV.set(0, 0, 0), 0.22); rcL.y = pp.y - 1.5;
+      rcW.copy(pp).addScaledVector(out, 15).addScaledVector(fw, 6); rcW.y += 8;
+      rcL.copy(pp).lerp(tmpV.set(0, 0, 0), 0.5); rcL.y = pp.y * 0.35;   // 썰매와 마을 가운데(트리) 사이를 봄 — 썰매 · 순록 · 마을 전경이 함께
     } else if (rideCam === 1) {
       // 자리에서 고개를 돌려 마을 쪽(원 안쪽)을 비스듬히 내려다봅니다 — 앞의 순록에 가리지 않게
       rcW.copy(pp).addScaledVector(fw, -0.1).addScaledVector(out, -0.5); rcW.y += 2.6;
@@ -3157,7 +4992,9 @@
     takeBell(player);
     santa.userData.gesture = { type: 'wave', t: 0, dur: 3 };
     sayBubble(santa, '잘 다녀오렴! 허허허');
-    jingle(14, 0.07);
+    jingle(8, 0.05);
+    songI = 0;   // 징글벨
+    setTimeout(() => { if (ride) playSong(); }, 600);
     toast('🛷 출발! 마을 위를 한 바퀴 날아요');
     refreshPanel(true);
   }
@@ -3181,6 +5018,7 @@
       player.position.set(SL.seat.x, SL.seatY - 0.42, SL.seat.z);
       player.rotation.y = targetYaw = SL.seatRy;
       sayBubble(santa, '어서 오렴! 하늘은 어땠니?');
+      stopSong();
       jingle(8, 0.06);
       toast('🛷 무사히 도착! 즐거운 비행이었어요');
       yawGoal = null;
@@ -3205,7 +5043,7 @@
     player.rotation.y = targetYaw = g.rotation.y + Math.PI / 2;
     for (const d of SL.deer) d.userData.excite = 0.5;
     ride.bellT -= dt;
-    if (ride.bellT < 0) { ride.bellT = 0.22; bell(0.025 + lift * 0.01); }
+    if (ride.bellT < 0) { ride.bellT = 0.9; bell(0.008); }   // 방울은 아주 작게 — 캐럴이 주인공
     ride.trailT -= dt;
     if (ride.trailT < 0 && lift > 0.08) {
       ride.trailT = 0.05;
@@ -3226,27 +5064,34 @@
   // ------------------------------------------------------------------
   // 장소 패널
   // ------------------------------------------------------------------
-  let curPlace = null;
+  let curPlace = null, lastDescPlace = null;   // lastDescPlace: 설명 토스트를 마지막으로 띄운 장소 (같은 곳 반복 X)
   function actionsFor(p) {
     const u = player.userData;
     if (p.id === 'tree') return [
       [`✨ 불빛 바꾸기 (지금: ${MODES[TREE.mode]})`, cycleLights],
       [songPlaying ? '⏹ 오르골 멈추기' : `🎶 캐럴 오르골 — ${SONGS[songI % SONGS.length].name}`, () => { if (songPlaying) { stopSong(); refreshPanel(true); } else { lookTree(); playSong(); } }, songPlaying],
       ['💌 소원 오너먼트 달기', hangWish],
+      ...(pickedWish ? [[`🗑 고른 오너먼트 떼기`, () => removeWish(pickedWish)]] : wishes.length ? [['🗑 마지막 오너먼트 떼기', () => removeWish(wishes[wishes.length - 1])]] : []),
     ];
-    if (p.id === 'cocoa') return [['☕ 코코아 마시기', drinkCocoa], ['🎶 캐럴 흥얼거리기', () => { player.userData.gesture = { type: 'dance', t: 0, dur: 3 }; faceCam(0.6, 5, 0.2); if (!songPlaying) playSong(); }]];
-    if (p.id === 'workshop') return [['🎁 선물 열어 보기', openGift], ['🎅 선물 받기', () => receiveGift(pick(GIFT_ITEMS))], ['🔔 방울 흔들기', ringBell]];
+    if (p.id === 'cocoa') return [['☕ 코코아 마시기', drinkCocoa]];
+    if (p.id === 'workshop') return [['🎁 선물 열어 보기', openGift], ['🔔 방울 흔들기', ringBell]];
     if (p.house) return [[p.house.workshop ? '🚪 문 열고 공방 구경하기' : '🚪 문 열고 들어가기', () => enterHouse(p.house)]];
-    if (p.station !== undefined) return [['🎁 이 선물 받기', () => receiveGift(GIFT_ITEMS[p.station])], ['🚪 밖으로 나가기', () => exitHouse()]];
+    if (p.station !== undefined) return [['🎁 이 선물 받기', () => receiveStation(p.station)], ['🚪 밖으로 나가기', () => exitHouse()]];
     if (p.id === 'inside') {
-      if (inHouse && inHouse.workshop) return [['🎁 아무 선물이나 받기', () => receiveGift(pick(GIFT_ITEMS))], ['🔥 벽난로 불 쬐기', warmFire], ['🚪 밖으로 나가기', () => exitHouse()]];
+      if (inHouse && inHouse.workshop) return [['🔥 벽난로 불 쬐기', warmFire], ['🚪 밖으로 나가기', () => exitHouse()]];
+      const TH = THEMES[curTheme];
+      if (TH && TH.actions) {
+        if (sitting) return [...(TH.sitActions ? TH.sitActions(TH) : []), ['🙋 일어나기', standUp], ['🚪 밖으로 나가기', () => exitHouse()]];
+        return [...TH.actions(TH), ['🚪 밖으로 나가기', () => exitHouse()]];
+      }
+      if (sitting === 'sofa') return [['🍪 쿠키 먹기', eatCookie], ['🙋 일어나기', standUp], ['🚪 밖으로 나가기', () => exitHouse()]];
       if (sitting) return [['🙋 일어나기', standUp], ['🚪 밖으로 나가기', () => exitHouse()]];
-      return [['🛋 소파에 앉기', sitSofa], ['🔥 벽난로 불 쬐기', warmFire], ['🍪 쿠키 먹기', eatCookie], [intTreeOn ? '🎄 작은 트리 불 끄기' : '🎄 작은 트리 불 켜기', toggleIntTree, intTreeOn], ['🚪 밖으로 나가기', () => exitHouse()]];
+      return [['🛋 소파에 앉기', sitSofa], ['🔥 벽난로 불 쬐기', warmFire], [intTreeOn ? '🌙 트리 불 끄기' : '✨ 트리에 불 밝히기', toggleIntTree], ['🚪 밖으로 나가기', () => exitHouse()]];
     }
     if (p.id === 'snowman' && roll) return [];
     if (p.id === 'snowman') return [
       snowMan.stage < 5 ? [`☃️ 눈 굴리기 — ${SNOW_STEPS[snowMan.stage]} (${snowMan.stage}/5)`, rollSnow] : ['🔄 새 눈사람 만들기', resetSnowman],
-      ['❄️ 눈뭉치 던지기', () => throwSnowball(player)],
+      ['❄️ 눈 뿌리기', () => throwSnowball(player)],
     ];
     if (p.id === 'sleigh' && sitting === 'ride') return [[`📷 시점 바꾸기 (지금: ${RIDE_CAMS[rideCam]})`, cycleRideCam]];
     if (p.id === 'sleigh') return sitting === 'sleigh'
@@ -3261,6 +5106,7 @@
     if (p.id === 'snowman') return snowMan.stage >= 5 ? '눈사람 완성!' : `눈사람 ${snowMan.stage}/5 단계`;
     if (p.id === 'sleigh' && sitting === 'ride') return '🛷 마을 위를 날고 있어요! 아래를 내려다보세요';
     if (p.id === 'inside' && inHouse && inHouse.workshop) return '받침대 가까이 가면 그 선물을 받을 수 있어요';
+    if (p.id === 'inside' && inHouse && sitting !== 'sofa') return '소파에 앉으면 앞에 놓인 쿠키를 먹을 수 있어요';
     if (p.id === 'pond') return player.userData.skate ? '방향키 · 클릭으로 미끄러지듯 움직여요' : '';
     return '';
   }
@@ -3270,6 +5116,7 @@
     if (!force && el.dataset.id === curPlace.id) return;
     el.dataset.id = curPlace.id;
     el.innerHTML = '';
+    el.classList.add('compact');
     const h = document.createElement('h3'); h.textContent = `${curPlace.emoji} ${curPlace.name}`;
     const d = document.createElement('p'); d.textContent = curPlace.desc;
     el.append(h, d);
@@ -3299,12 +5146,13 @@
     }
     $('#btn-places').onclick = () => box.classList.toggle('show');
   }
-  placeById.tree.go = [0, 6.8];
+  placeById.tree.go = [0, 9.3];   // 광장 가장자리 — 여기서 뒤로 물러난 카메라가 트리 꼭대기 별까지 담음
   function goTo(p) {
     if (sitting === 'ride' || sitting === 'roll') return;
     if (player.userData.skate) { toast(SKATE_MSG); return; }
     if (inHouse) { exitHouse(() => goTo(p)); return; }
     yawGoal = Math.atan2(p.go[0] - p.x, p.go[1] - p.z);
+    if (p.id === 'tree') camGoal = { p: 0.07, d: 16 };   // 낮고 멀리서 — 큰 트리가 별까지 한눈에
     standUp();
     pendingAct = null;
     moveTarget = new THREE.Vector3(p.go[0], 0, p.go[1]);
@@ -3330,13 +5178,33 @@
     if (['w', 'a', 's', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(k)) { keys.add(k); e.preventDefault(); if (sitting) standUp(); moveTarget = null; pendingAct = null; }
   });
   addEventListener('keyup', (e) => keys.delete(e.key.toLowerCase()));
-  let running = false, runTipShown = false, yawGoal = null, camGoal = null;
+  let running = false, runTipShown = false, yawGoal = null, camGoal = null, userDist = 12.5;   // userDist: 걸을 때 돌아갈 카메라 거리
+  const detour = { t: 0, side: 0 };   // 바깥에서 막혔을 때 옆으로 비켜 가기
   const lookFrom = (y, p, d) => { yawGoal = y; camGoal = { p, d }; };
   addEventListener('blur', () => keys.clear());
   const cv = renderer.domElement;
   let drag = null;
-  cv.addEventListener('pointerdown', (e) => { drag = { x: e.clientX, y: e.clientY, moved: 0, id: e.pointerId }; cv.setPointerCapture(e.pointerId); ensureAudio(); });
+  // 손가락 두 개 — 벌리면 확대, 오므리면 축소 (휴대폰에는 휠이 없으니까)
+  const touches = new Map();
+  let pinch = null;
+  const pinchDist = () => { const [a, b] = [...touches.values()]; return Math.hypot(a.x - b.x, a.y - b.y) || 1; };
+  cv.addEventListener('pointerdown', (e) => {
+    touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    ensureAudio();
+    if (touches.size === 2) { pinch = { d: pinchDist(), dist }; drag = null; camGoal = null; return; }   // 두 번째 손가락 → 핀치
+    if (touches.size > 2) return;
+    drag = { x: e.clientX, y: e.clientY, moved: 0, id: e.pointerId };
+    cv.setPointerCapture(e.pointerId);
+  });
+  const endTouch = (e) => { touches.delete(e.pointerId); if (touches.size < 2 && pinch) { pinch = null; drag = null; } };
+  cv.addEventListener('pointercancel', (e) => { endTouch(e); drag = null; });
   cv.addEventListener('pointermove', (e) => {
+    if (touches.has(e.pointerId)) touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pinch && touches.size === 2) {
+      dist = clamp(pinch.dist * pinch.d / pinchDist(), 4, 28);
+      userDist = dist;
+      return;
+    }
     if (!drag || drag.id !== e.pointerId) return;
     const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
     drag.moved += Math.abs(dx) + Math.abs(dy);
@@ -3346,13 +5214,19 @@
     pitch = clamp(pitch + dy * 0.004, 0.06, 1.2);
   });
   cv.addEventListener('pointerup', (e) => {
-    if (!drag) return;
+    const wasPinch = !!pinch;
+    endTouch(e);
+    if (wasPinch || !drag) { drag = null; return; }
     const d = drag;
     drag = null;
     if (d.moved < 8) handleClick(e);
   });
   cv.addEventListener('wheel', (e) => {
-    camGoal = null; dist = clamp(dist * (1 + Math.sign(e.deltaY) * 0.1), 4, 28); e.preventDefault(); }, { passive: false });
+    camGoal = null;
+    dist = clamp(dist * (1 + Math.sign(e.deltaY) * 0.1), 4, 28);
+    userDist = dist;   // 휠로 고른 거리를 기억 — 걸을 때 이 거리로 돌아감
+    e.preventDefault();
+  }, { passive: false });
   const ray = new THREE.Raycaster(), ndc = new THREE.Vector2();
   let lastClick = { t: 0, x: 0, y: 0 };
   function handleClick(e) {
@@ -3365,10 +5239,46 @@
     // 문 · 선물 받침대 (앞에 가리는 것이 없을 때만)
     const first = ray.intersectObjects(inHouse ? [ROOM] : [...HOUSE_LIST.map((h) => h.g), ...walkables], true)[0];
     if (first && first.object.userData.house) { enterHouse(first.object.userData.house); return; }
+    if (first && !inHouse) {
+      let o = first.object;
+      while (o && !HOUSE_LIST.some((h) => h.g === o)) o = o.parent;
+      const h = o && HOUSE_LIST.find((hh) => hh.g === o);
+      if (h) {
+        if (player.userData.skate) { toast(SKATE_MSG); return; }
+        if (sitting) standUp();
+        pendingAct = null; detour.t = 0; detour.side = 0;
+        moveTarget = h.doorSpot.clone(); stuckT = 0; bestD = Infinity; running = dbl;
+        toast(`🚪 ${h.place.name} 문 앞으로 가요`);
+        return;
+      }
+    }
     if (first && first.object.userData.exit) { exitHouse(); return; }
     if (first && first.object.userData.station !== undefined) { const st = STATIONS[first.object.userData.station]; walkThen(st.spot, () => faceTo(player, st.pos)); return; }
-    const w = ray.intersectObjects(wishMeshes, false)[0];
-    if (w) { toast(`💌 "${w.object.userData.wish}"`, 3800); tone(1046, 0.05, 0.8); return; }
+    const wm = pickWishByRay(ray);
+    if (wm) {
+      pickedWish = wm.userData.w;
+      toast(`💌 "${wm.userData.wish}" — 아래 패널에서 뗄 수도 있어요`, 3800);
+      tone(1046, 0.05, 0.8);
+      refreshPanel(true);
+      return;
+    }
+    // 트리 · 집 · 소품 같은 물건을 누르면 그 뒤 땅이 아니라 물건 앞(내 쪽)으로 걸어감
+    {
+      const hits = ray.intersectObjects(scene.children, true);
+      const h0 = hits.find((h) => h.object.visible && h.object.isMesh && h.object !== sky && h.distance < 120 && !(h.object.material && h.object.material.transparent && h.object.material.opacity < 0.3));
+      if (h0 && !walkables.includes(h0.object) && !inHouse) {
+        if (player.userData.skate) { toast(SKATE_MSG); return; }
+        if (sitting) standUp();
+        pendingAct = null;
+        const tp = h0.point.clone();
+        const back = new THREE.Vector3(player.position.x - tp.x, 0, player.position.z - tp.z);
+        if (back.lengthSq() > 1e-4) tp.addScaledVector(back.normalize(), 0.3);
+        tp.y = 0;
+        pushOut(tp);
+        moveTarget = tp; stuckT = 0; bestD = Infinity; running = dbl;
+        return;
+      }
+    }
     const hit = ray.intersectObjects(walkables, false)[0];
     if (!hit) return;
     if (player.userData.skate && !onIce(hit.point.x, hit.point.z)) { toast(SKATE_MSG); return; }
@@ -3395,10 +5305,19 @@
   $('#g-wave').onclick = () => { faceCam(0.5, 5.5, 0.2); player.userData.gesture = { type: 'wave', t: 0, dur: 2.4 }; };
   $('#g-bow').onclick = () => { faceCam(0.6, 5.5, 0.2); player.userData.gesture = { type: 'bow', t: 0, dur: 1.8 }; };
   $('#g-dance').onclick = () => { ensureAudio(); faceCam(0.5, 6, 0.2); player.userData.gesture = { type: 'dance', t: 0, dur: 4 }; jingle(6, 0.04); };
-  $('#g-snow').onclick = () => { ensureAudio(); if (inHouse) { toast('집 안에서는 눈뭉치를 던질 수 없어요 😅'); return; } if (!sitting) throwSnowball(player); };
+  $('#g-snow').onclick = () => { ensureAudio(); if (inHouse) { toast('집 안에서는 눈을 뿌릴 수 없어요 😅'); return; } if (!sitting) throwSnowball(player); };
   $('#g-jump').onclick = () => { ensureAudio(); jump(); };
   $('#btn-help').onclick = () => $('#help').classList.add('show');
   $('#help-close').onclick = () => $('#help').classList.remove('show');
+  $('#btn-music').onclick = () => {
+    bgmOn = !bgmOn;
+    localStorage.setItem('santa.bgm', bgmOn ? 'on' : 'off');
+    startBgm();
+    bgmLevel();
+    musicLabel();
+    toast(bgmOn ? '🎵 배경음악을 켰어요' : '배경음악을 껐어요');
+  };
+  musicLabel();
   $('#btn-sound').onclick = () => {
     ensureAudio();
     soundOn = !soundOn;
@@ -3412,6 +5331,7 @@
     if (!v) return;
     myName = v.slice(0, 12);
     localStorage.setItem('santa.name', myName);
+    localStorage.setItem('shelter:name', myName);
     $('#myname').textContent = myName;
     const u = player.userData;
     if (u.label) { player.remove(u.label); }
@@ -3437,7 +5357,7 @@
   // ------------------------------------------------------------------
   const clock = new THREE.Clock();
   const camTarget = new THREE.Vector3(0, 1.4, 16);
-  let camDist = 12.5;
+  let camDist = 12.5, viewOff = 0;   // viewOff: 아래 패널만큼 화면을 위로 올리는 비율
   let elapsed = 0, stepPhase = 0, birdT = 8, bellT = 14, lightT = 0, fireT = 0;
   const tmpC = new THREE.Color(), tmpC2 = new THREE.Color(), tmpC3 = new THREE.Color();
   function updateTreeLights(t) {
@@ -3449,8 +5369,10 @@
       else if (TREE.mode === 2) { tmpC.setHSL(((i / N) * 4 - t * 0.25) % 1 + (((i / N) * 4 - t * 0.25) % 1 < 0 ? 1 : 0), 1, 0.55); }
       else { const k = 0.7 + 0.3 * Math.sin(t * 3 + b.ph); tmpC.setRGB(1.25 * k, 0.95 * k, 0.55 * k); }
       TREE.bulbs.setColorAt(i, tmpC);
+      const ga = TREE.glowPts.colAttr.array; ga[i * 3] = tmpC.r * 0.8; ga[i * 3 + 1] = tmpC.g * 0.8; ga[i * 3 + 2] = tmpC.b * 0.8;
     }
     TREE.bulbs.instanceColor.needsUpdate = true;
+    TREE.glowPts.colAttr.needsUpdate = true;
     // 은은한 빛 — 모드마다 색과 숨결이 다릅니다
     let gk = 1;
     const want = tmpC2;
@@ -3476,11 +5398,28 @@
     TREE.glow.material.color.copy(TREE.glowCol).lerp(tmpC3.set('#fff1a8'), 0.5);
     for (let i = 0; i < bulbPts.length; i++) {
       const b = bulbPts[i];
-      const k = 0.55 + 0.45 * Math.sin(t * 1.6 + b.ph);
-      tmpC.copy(b.c).multiplyScalar(0.45 + k * 0.8);
+      if (b.strand >= 0) {
+        // 무지개 줄 전구 — 한 줄씩 차례로(1.1초마다 다음 줄) 가로등 쪽부터 꼭대기까지 불이 차오름.
+        //   켜진 줄은 은은하게 남았다가 서서히 사그라들어, 여러 줄이 번갈아 물결치듯 이어짐
+        const cyc = t / 0.45;   // 0.45초마다 다음 줄 (예전 1.1초 — 너무 느려 꺼진 것처럼 보였음)
+        const age = ((cyc - b.strand) % STRANDS + STRANDS) % STRANDS;   // 이 줄이 켜진 뒤 지난 '줄 시간'
+        const f = b.k / b.n;
+        const fill = clamp((age * 2.6 - f) * 4, 0, 1);                   // 아래 → 위로 빠르게 차오름
+        const fade = Math.max(0, 1 - Math.max(0, age - 0.8) / 3.2);       // 그 뒤 천천히 사그라듦 — 늘 절반쯤은 켜져 있게
+        const lit = fill * fade;
+        const hue = (((f * 0.9 + t * 0.12 + b.strand / STRANDS) % 1) + 1) % 1;
+        tmpC.setHSL(hue, 1, 0.55).multiplyScalar(0.38 + lit * 1.0);   // 쉬는 줄도 은은하게 켜 둠
+        bulbIM2.setColorAt(i, tmpC);
+        const ga = strandGlow.colAttr.array, gi = b.gi * 3;
+        const gl = 0.2 + lit * 0.8;
+        ga[gi] = tmpC.r * gl; ga[gi + 1] = tmpC.g * gl; ga[gi + 2] = tmpC.b * gl;
+        continue;
+      }
+      tmpC.copy(b.c).multiplyScalar(0.35 + bulbTwinkle(t, b.ph) * 1.1);
       bulbIM2.setColorAt(i, tmpC);
     }
     bulbIM2.instanceColor.needsUpdate = true;
+    strandGlow.colAttr.needsUpdate = true;
   }
 
   function tick() {
@@ -3505,10 +5444,37 @@
     if (!sitting && moveTarget && !ix && !iz) {
       const dx = moveTarget.x - player.position.x, dz = moveTarget.z - player.position.z;
       const d = Math.hypot(dx, dz);
-      if (d < 0.25) { moveTarget = null; running = false; if (pendingAct) { const a = pendingAct; pendingAct = null; a.fn(); } }
+      if (d < 0.25) { moveTarget = null; running = false; detour.t = 0; detour.side = 0; if (pendingAct) { const a = pendingAct; pendingAct = null; a.fn(); } }
       else {
         ix = dx / d; iz = dz / d;
-        if (d < bestD - 0.05) { bestD = d; stuckT = 0; } else { stuckT += dt; if (stuckT > 2.5) { moveTarget = null; pendingAct = null; } }
+        // 걸어서 가는 길이 스케이트장을 가로지르면 — 얼음판 둘레를 따라 돌아서 감
+        if (!u.skate && !inHouse) {
+          const m = 1.5, ax = POND.rx + m, az = POND.rz + m;
+          const px = (player.position.x - POND.x) / ax, pz = (player.position.z - POND.z) / az;
+          const qx = (moveTarget.x - POND.x) / ax, qz = (moveTarget.z - POND.z) / az;
+          const sx = qx - px, sz = qz - pz, sl = sx * sx + sz * sz || 1;
+          const k = clamp(-(px * sx + pz * sz) / sl, 0, 1);
+          if (k > 0.02 && Math.hypot(px + sx * k, pz + sz * k) < 0.95 && Math.hypot(qx, qz) > 1) {   // 얼음 쪽으로 파고드는 길일 때만 (가장자리에서 멀어지는 길은 그대로)
+            const side = px * qz - pz * qx >= 0 ? 1 : -1;
+            const ang = Math.atan2(pz, px) + side * 0.9;
+            const wx = POND.x + Math.cos(ang) * ax * 1.15, wz = POND.z + Math.sin(ang) * az * 1.15;
+            const wl = Math.hypot(wx - player.position.x, wz - player.position.z) || 1;
+            ix = (wx - player.position.x) / wl; iz = (wz - player.position.z) / wl;
+            bestD = Infinity;   // 돌아가는 동안은 '막힘' 으로 보지 않음
+          }
+        }
+        if (d < bestD - 0.05) { bestD = d; stuckT = 0; if (detour.t <= 0) detour.side = 0; } else { stuckT += dt; if (stuckT > 5.5) { moveTarget = null; pendingAct = null; detour.t = 0; detour.side = 0; } }
+        // 0.45초 넘게 가까워지지 않으면 — 물건 둘레를 따라 옆으로 1초씩 비켜 감 (집 · 나무 · 울타리)
+        if (!inHouse && stuckT > 0.45 && detour.t <= 0) {
+          if (!detour.side) { const cx = player.position.x * iz - player.position.z * ix; detour.side = cx >= 0 ? 1 : -1; }
+          detour.t = 1.0;
+        }
+        if (detour.t > 0) {
+          detour.t -= dt;
+          const ang = detour.side * 1.25, c = Math.cos(ang), sn = Math.sin(ang);
+          const nx = ix * c - iz * sn, nz = ix * sn + iz * c;
+          ix = nx; iz = nz;
+        }
       }
     }
     const il = Math.hypot(ix, iz);
@@ -3573,7 +5539,10 @@
       pnl = INSIDE;
       if (inHouse.workshop) { let best = 1.7; for (const st of STATIONS) { const dd = Math.hypot(player.position.x - st.pos.x, player.position.z - st.pos.z); if (dd < best) { best = dd; pnl = st.place; } } }
     } else { let best = 2.0; for (const h of HOUSE_LIST) { const dd = Math.hypot(player.position.x - h.doorSpot.x, player.position.z - h.doorSpot.z); if (dd < best) { best = dd; pnl = h.place; } } }
-    if (pnl !== curPlace) { curPlace = pnl; refreshPanel(true); }
+    if (pnl !== curPlace) {
+      if (pnl && pnl.desc && !sitting && pnl !== lastDescPlace) { toast(`${pnl.emoji} ${pnl.desc}`, 2800); lastDescPlace = pnl; }
+      curPlace = pnl; refreshPanel(true);
+    }
     for (const p of PLACES) { const m = p.label.material; m.opacity = lerp(m.opacity, p === near ? 0 : 1, Math.min(1, dt * 5)); p.label.visible = m.opacity > 0.02; }
 
     // --- 카메라
@@ -3594,6 +5563,10 @@
       dist = lerp(dist, camGoal.d, Math.min(1, dt * 2.5));
       if (Math.abs(pitch - camGoal.p) < 0.005 && Math.abs(dist - camGoal.d) < 0.03) camGoal = null;
     }
+    if (moving && !inHouse && !camGoal && !ride) {
+      dist = lerp(dist, clamp(userDist, 7, 28), Math.min(1, dt * 1.6));
+      if (pitch < 0.14) pitch = lerp(pitch, 0.2, Math.min(1, dt * 1.2));
+    }
     const wantDist = inHouse ? Math.min(dist, 8) : ride ? 14 : dist;
     // 건물에 가리면 카메라를 앞으로 당깁니다
     let allow = wantDist;
@@ -3605,10 +5578,10 @@
         for (const b of blockers) {
           if (!b.h || py > b.h) continue;
           const ox = px - b.x, oz = pz - b.z;
-          if (b.r !== undefined) { if (Math.hypot(ox, oz) < b.r + 0.6) { hitB = true; break; } continue; }
+          if (b.r !== undefined) continue;   // 나무는 가려도 그냥 둠 — 당기면 숲에서 코앞까지 줌인돼 길을 못 봄
           if (Math.abs(ox * b.c - oz * b.s) < b.hw + 0.3 && Math.abs(ox * b.s + oz * b.c) < b.hd + 0.3) { hitB = true; break; }
         }
-        if (hitB) { allow = Math.max(1.8, k2 - wantDist / 14); break; }
+        if (hitB) { allow = Math.max(4.5, k2 - wantDist / 14); break; }
       }
     }
     camDist = allow < camDist ? lerp(camDist, allow, Math.min(1, dt * 14)) : lerp(camDist, allow, Math.min(1, dt * 2.5));
@@ -3622,15 +5595,24 @@
       camera.position.x = clamp(camera.position.x, INT.x - INT.W / 2 - 3, INT.x + INT.W / 2 + 3);
       camera.position.z = clamp(camera.position.z, INT.z - INT.D / 2 + 0.4, INT.z + INT.D / 2 + 4);
       camera.position.y = clamp(camera.position.y, 0.6, INT.H - 0.25);
-      WALLS.front.visible = camera.position.z < INT.z + INT.D / 2;
-      WALLS.left.visible = camera.position.x > INT.x - INT.W / 2;
-      WALLS.right.visible = camera.position.x < INT.x + INT.W / 2;
+      // 카메라가 벽 근처에서 오락가락해도 벽이 깜빡이지 않게 ±0.4 여유
+      const cz = camera.position.z - (INT.z + INT.D / 2), cxl = (INT.x - INT.W / 2) - camera.position.x, cxr = camera.position.x - (INT.x + INT.W / 2);
+      if (cz > -0.05) WALLS.front.visible = false; else if (cz < -0.45) WALLS.front.visible = true;
+      if (cxl > -0.05) WALLS.left.visible = false; else if (cxl < -0.45) WALLS.left.visible = true;
+      if (cxr > -0.05) WALLS.right.visible = false; else if (cxr < -0.45) WALLS.right.visible = true;
     } else {
       const cg = groundY(camera.position.x, camera.position.z) + 0.6;
       if (camera.position.y < cg) camera.position.y = cg;
     }
     camera.lookAt(camTarget);
     if (ride) updateRideCam(dt); else if (!player.visible) player.visible = true;
+    {
+      const pnl = document.getElementById('panel');
+      const want = pnl.classList.contains('show') ? (pnl.offsetHeight + 24) / innerHeight * 0.5 : 0;
+      viewOff = lerp(viewOff, want, Math.min(1, dt * 4));
+      if (viewOff > 0.002) camera.setViewOffset(innerWidth, innerHeight, 0, viewOff * innerHeight, innerWidth, innerHeight);
+      else if (camera.view && camera.view.enabled) camera.clearViewOffset();
+    }
     sun.position.copy(camTarget).addScaledVector(sunDir, 70);
     sun.target.position.copy(camTarget);
     sky.position.copy(camera.position);
@@ -3718,6 +5700,8 @@
     for (const c of clouds) { c.userData.a += dt * 0.004; c.position.x = Math.cos(c.userData.a) * c.userData.r; c.position.z = Math.sin(c.userData.a) * c.userData.r; }
 
     updateGift(dt);
+    updateHanging(dt);
+    updateFloaters(dt);
     // 문 여닫기
     for (const h of HOUSE_LIST) { const want = -h.doorT * 1.6; if (Math.abs(h.door.rotation.y - want) > 0.001) h.door.rotation.y = lerp(h.door.rotation.y, want, Math.min(1, dt * 5)); }
     intDoor.rotation.y = lerp(intDoor.rotation.y, intDoorT * 1.5, Math.min(1, dt * 5));
@@ -3732,13 +5716,21 @@
       fireGlow.material.opacity = 0.6 + Math.sin(t * 9) * 0.1;
       winFlakes.offset.y += dt * 0.07;
       winFlakes.offset.x = Math.sin(t * 0.4) * 0.03;
-      for (const b of intTreeBulbs) {
-        const tw = 0.5 + 0.5 * Math.sin(t * 2.4 + b.userData.ph);
-        b.material.color.copy(b.userData.base).multiplyScalar(intTreeOn ? 0.5 + 0.6 * tw : 0.12);
-        b.userData.glow.material.opacity = intTreeOn ? 0.15 + 0.6 * tw * tw : 0;
-      }
-      intTreeHalo.material.opacity = intTreeOn ? 0.22 + 0.08 * Math.sin(t * 1.3) : 0;
+      // 켜면 2.5초에 걸쳐 아래부터 하나둘 켜지고, 켜진 전구는 저마다 숨 쉬듯 깜빡임 / 끄면 천천히 꺼짐
+      intTreeLevel = clamp(intTreeLevel + (intTreeOn ? dt / 2.5 : -dt / 1.2), 0, 1);
+      const NB = intTreeBulbs.length;
+      intTreeBulbs.forEach((b, k) => {
+        const on = smooth(k / NB, k / NB + 0.12, intTreeLevel * 1.12);
+        const tw = 0.5 + 0.5 * Math.sin(t * 2.2 + b.userData.ph);
+        const blink = Math.sin(t * 0.7 + b.userData.ph * 3) > 0.93 ? 0.35 : 1;   // 가끔 살짝 깜빡
+        const k2 = on * (0.35 + 0.65 * tw * tw) * blink;
+        b.material.color.copy(b.userData.base).multiplyScalar(0.12 + k2 * 1.05);
+        b.userData.glow.material.opacity = k2 * 0.7;
+      });
+      intTreeHalo.material.opacity = intTreeLevel * (0.24 + 0.08 * Math.sin(t * 1.3));
       for (const st of STATIONS) st.item.rotation.y = t * 0.6 + st.i;
+      const TT = THEMES[curTheme];
+      if (TT && TT.update) TT.update(TT, dt, t);
     }
     updateConfetti(dt);
     updateBalls(dt);
@@ -3747,6 +5739,7 @@
     snowfall.uniforms.uTime.value = t;
     snowfall.uniforms.uCam.value.copy(camera.position);
     glitter.uniforms.uTime.value = t;
+    for (const m of glowMats) m.uniforms.uTime.value = t;
 
     // --- 배경 소리
     if (actx && soundOn) {
@@ -3770,6 +5763,7 @@
     act: (id, i) => actionsFor(placeById[id])[i][1](),
     actP: (p, i) => actionsFor(p)[i][1](),
     runTo: (x, z) => { moveTarget = new THREE.Vector3(x, 0, z); running = true; stuckT = 0; bestD = Infinity; },
+    state: () => ({ sitting, moveTarget: moveTarget && moveTarget.toArray(), inHouse: !!inHouse, doorBusy, pose: player.userData.pose, armsMode: player.userData.armsMode, stuckT, detour: { ...detour } }),
     houses: () => HOUSE_LIST, stations: () => STATIONS, inside: () => INSIDE, player: () => player, enter: (i) => enterHouse(HOUSE_LIST[i]), exit: () => exitHouse(), jump: () => jump(),
     places: placeById,
   };
@@ -3780,9 +5774,50 @@
   const enter = $('#enter');
   enter.disabled = false;
   enter.textContent = '🎄 마을로 들어가기';
+  {
+    // 다른 공간 탭 — 쉼터 저장소 안(산타/ 폴더 · /santa/ 주소)에 있을 때만 보임
+    const inShelter = location.protocol !== 'file:' || /healing-space/.test(decodeURIComponent(location.pathname));
+    const DESTS = [
+      { icon: '🌲', label: '쉼터', title: '쉼터로 이동', goText: '🌲 쉼터로 이동 중', local: '../index.v2.html', web: '/' },
+      { icon: '🔥', label: '불멍', title: '불멍 캠프로 이동', goText: '🔥 불멍 캠프로 이동 중', local: '../불멍/index.html', web: '/bulmeong/' },
+    ];
+    let anchor = $('#btn-places');
+    if (inShelter) for (const D of DESTS) {
+      const b = document.createElement('button');
+      b.type = 'button'; b.className = 'glass iconbtn space-tab'; b.title = D.title;
+      b.innerHTML = `${D.icon}<span class="lbl"> ${D.label}</span>`;
+      b.onclick = () => {
+        $('#places').classList.remove('show');
+        const tv = $('#travel');
+        tv.querySelector('.go-text').textContent = D.goText;
+        tv.classList.remove('instant');
+        tv.classList.add('on');
+        stopSong();
+        if (master && actx) master.gain.setTargetAtTime(0, actx.currentTime, 0.15);
+        const base = location.protocol === 'file:' ? new URL(D.local, location.href).href : new URL(D.web, location.origin).href;
+        setTimeout(() => location.assign(`${base}?room=${encodeURIComponent(room)}&go=1`), 500);
+      };
+      anchor.after(b); anchor = b;
+    }
+  }
+  if (params.get('go') === '1') {
+    // 건너왔으면 — 시작 화면 없이 바로 마을로. 주소의 go=1 은 지워서 공유하면 시작 화면부터
+    const u = new URL(location.href); u.searchParams.delete('go'); history.replaceState(null, '', u.toString());
+    setTimeout(() => {
+      enter.click();
+      document.documentElement.classList.remove('arriving');
+      const tv = $('#travel');
+      tv.classList.remove('instant');
+      let frames = 0;
+      const reveal = () => (++frames < 8 ? requestAnimationFrame(reveal) : tv.classList.remove('on'));
+      requestAnimationFrame(reveal);
+      setTimeout(() => { if (!actx || actx.state !== 'running') toast('🔊 화면을 한 번 누르면 소리가 켜져요', 4000); }, 1200);
+    }, 0);
+  }
   enter.onclick = () => {
     ensureAudio();
     startAmbient();
+    startBgm();
     jingle(10, 0.05);
     $('#intro').classList.remove('show');
     setTimeout(() => toast('❄️ 눈 내리는 산타 마을에 오신 걸 환영해요!', 3200), 300);
